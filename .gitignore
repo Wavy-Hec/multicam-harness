@@ -1,0 +1,35 @@
+# Run outputs — stay on the machine / NAS, never in git
+results/
+outputs/
+logs/
+runs/
+
+# Raw data / video / weights
+data/
+*.avi
+*.mp4
+*.pt
+*.bin
+*.safetensors
+*.tar
+*.tar.gz
+*.zip
+
+# Figures are regenerable; commit only deliberately under figures/
+*.png
+*.jpg
+*.jpeg
+!figures/*.png
+!figures/*.jpg
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.python-version
+.ipynb_checkpoints/
+
+# Secrets
+.env
+*.key

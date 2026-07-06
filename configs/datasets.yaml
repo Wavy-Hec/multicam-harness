@@ -1,0 +1,6 @@
+# Question categories evaluated per dataset. Edit here (not in code) to narrow a run.
+categories:
+  meva:      [counting, spatial, temporal, event_ordering, best_camera, summarization]
+  nuscenes:  [counting, spatial, temporal, event_ordering, summarization]
+  ego-exo4d: [temporal, event_ordering, best_camera, summarization]
+  agibot:    [temporal, event_ordering, summarization]

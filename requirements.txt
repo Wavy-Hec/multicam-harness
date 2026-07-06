@@ -1,0 +1,7 @@
+openai
+numpy
+opencv-python-headless
+tqdm
+rouge-score
+pyyaml
+matplotlib
