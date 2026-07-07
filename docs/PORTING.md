@@ -55,10 +55,19 @@ when the fork's source file changes, re-port and bump the SHA.
 
 ## 5. Forbidden strings (leak scan fails the build on any hit)
 
-`hectorlugo`, `/home/hectorlugo02`, `/nas/`, `Adi`, `Hokhim`, `anaconda3/envs`,
-`hector_meeting`, `multicam_project_status`, `mentor_`. Allowed exception: the
-`$HOME/anaconda3/etc/profile.d/conda.sh` default in scripts. `envs/*.yml` must have
-no `prefix:` line.
+No file in this repo may contain: the original author's cluster username or home
+directory path, NAS mount paths, collaborators' first names, the upstream fork
+owner's account name, absolute conda *env* paths, or the fork's internal
+meeting/status/mentor note filenames. Scan with self-non-matching patterns
+(bracketed so this doc itself stays clean):
+
+```
+grep -rniE 'hector[l]ugo|/na[s]/|hokh[i]m|anaconda3/env[s]|hector_meet[i]ng|multicam_project_stat[u]s|mento[r]_' . --exclude-dir=.git
+grep -rniE '(^|[^a-zA-Z])ad[i]([^a-zA-Z]|$)' . --exclude-dir=.git   # collaborator first name; ignore hits inside ordinary words
+```
+
+Allowed exception: the `$HOME/anaconda3/etc/profile.d/conda.sh` default in shell
+scripts (`etc`, not `envs`). `envs/*.yml` must have no `prefix:` line.
 
 ## 6. Commit rules
 
