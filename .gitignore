@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# outputs never go in git
+results/*
+!results/.gitkeep
+logs/*
+!logs/.gitkeep
+figures/
+
+# data: subset JSONs are committed (data/subsets/); videos never
+data/videos/
+*.part
+*.tmp
