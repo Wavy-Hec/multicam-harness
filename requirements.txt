@@ -5,3 +5,11 @@ tqdm
 rouge-score
 pyyaml
 matplotlib
+
+# --backend hf only (models/hf_backends.py): in-process Qwen3-VL/InternVL3, no vLLM server
+torch
+transformers
+qwen_vl_utils
+torchvision
+decord
+pillow

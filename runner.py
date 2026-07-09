@@ -13,7 +13,7 @@ import tqdm
 from dataloaders.qa_json import COUNTING_CATS, SUMMARIZATION_CATS
 from evaluation.scoring import counting_partial_credit, rouge
 from harnesses import get_frames
-from harnesses.decentralized import decentralized_answer, summarize_cameras
+from harnesses.decentralized.decentralized import decentralized_answer, summarize_cameras
 from models.cost import METER, BudgetExceeded
 
 # Output base dir. Default = repo root (results/). --out_dir overrides it so parallel

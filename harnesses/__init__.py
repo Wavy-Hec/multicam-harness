@@ -5,8 +5,8 @@ only how the multi-camera video is packaged for the model changes.
   stitched      — centralized: synchronized frames stitched into grid montages
   decentralized — per-camera text summaries, then text-only aggregation
 """
-from harnesses.decentralized import decentralized_frames
-from harnesses.stitched import stitched_frames_sampling_strategy
+from harnesses.decentralized.decentralized import decentralized_frames
+from harnesses.centralized.stitched import stitched_frames_sampling_strategy
 from harnesses.uniform import uniform_sampling_strategy
 
 STRATEGIES = ("uniform", "stitched", "decentralized")

@@ -5,6 +5,12 @@ Example (local vLLM on GPU 0):
         --data_dir /nas/neurosymbolic/multi-cam-dataset-organized/meva \
         --model OpenGVLab/InternVL3-8B --gpu 0 \
         --strategy uniform --num_frames 8
+
+Example (in-process HF backend, no vLLM server, e.g. on a SLURM box):
+    python run_vqa.py --dataset meva \
+        --data_dir /nas/neurosymbolic/multi-cam-dataset-organized/meva \
+        --model Qwen/Qwen2.5-VL-7B-Instruct --backend hf --device cuda:0 \
+        --strategy uniform --num_frames 8
 """
 import argparse
 import os
@@ -24,6 +30,12 @@ def main():
     parser.add_argument("--strategy", choices=["uniform", "stitched", "decentralized"], default="uniform")
     parser.add_argument("--gpu", type=int, default=0, help="sets api_base to localhost:800{gpu} for local vLLM")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct")
+    parser.add_argument("--backend", choices=["vllm", "hf"], default="vllm",
+                        help="vllm: local vLLM server or OpenAI API (default, unchanged behavior). "
+                             "hf: in-process HF-transformers backend (models/hf_backends.py), "
+                             "no server required — needs torch/transformers/etc. installed.")
+    parser.add_argument("--device", type=str, default="cuda:0",
+                        help="--backend hf only: device for the in-process model (e.g. cuda:0)")
     parser.add_argument("--num_frames", type=int, default=8)
     # decentralized-harness options (ignored by uniform/stitched)
     parser.add_argument("--aggregator_model", type=str, default="same",
@@ -71,19 +83,29 @@ def main():
         print(f"[COST] rough pre-run estimate for {args.model}: ~${est:.2f} over {n} questions "
               f"(hard cap ${args.max_usd:.2f}). This is approximate; the live cap is the real guard.")
 
-    vllm_client = VLLMClient(
-        api_base=f"http://localhost:800{args.gpu}/v1",
-        model=args.model, dataset=args.dataset, strategy=args.strategy, num_frames=args.num_frames,
-    )
+    if args.backend == "hf":
+        from models.hf_backends import HFClient
+        vllm_client = HFClient(model=args.model, device=args.device)
+    else:
+        vllm_client = VLLMClient(
+            api_base=f"http://localhost:800{args.gpu}/v1",
+            model=args.model, dataset=args.dataset, strategy=args.strategy, num_frames=args.num_frames,
+        )
     aggregator = None
     if args.strategy == "decentralized":
-        api_base = f"http://localhost:800{args.gpu}/v1"
         agg_model = args.model if args.aggregator_model == "same" else args.aggregator_model
         if agg_model in OPENAI_MODELS:
             aggregator = TextLLM(agg_model, api_key=resolve_openai_key())
+        elif args.backend == "hf":
+            raise SystemExit(
+                "--backend hf with --strategy decentralized needs --aggregator_model set to an "
+                f"OpenAI id (got '{agg_model}') — a local-HF-as-text-aggregator path isn't wired "
+                "up yet, only the OpenAI aggregator path is supported with the hf backend."
+            )
         else:
+            api_base = f"http://localhost:800{args.gpu}/v1"
             aggregator = TextLLM(agg_model, api_key="EMPTY", base_url=api_base)
-        print(f"Decentralized: per-camera summaries via {args.model}, "
+        print(f"Decentralized: per-camera summaries via {args.model} (backend={args.backend}), "
               f"text aggregation via {agg_model} "
               f"({'OpenAI' if agg_model in OPENAI_MODELS else 'local vLLM'}, frame_budget={args.frame_budget})")
     runner.run_experiment(datasets_by_category, vllm_client, vllm_client.model, args.num_frames, args.dataset,
