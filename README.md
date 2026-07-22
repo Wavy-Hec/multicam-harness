@@ -22,8 +22,8 @@ runner.py         # run loop: sharding, resume keys, per-pass seeding
 dataloaders/      # qa_json.py (record → messages, vendored), video.py (frame sampling)
 harnesses/        # base.py + uniform.py / stitched.py / decentralized.py / clip_select.py
 models/           # clients.py — Qwen3-VL and InternVL3 backends (InternVL import stays lazy)
-evaluation/       # scoring.py (parse_choice / gt_choice) + run metrics & summaries
-plotting/         # plot_results.py — Table 1 + Plots 1–4 from results JSONL
+evaluation/       # scoring.py (parse_choice / gt_choice), chance.py + run metrics & summaries
+plotting/         # plot_results.py — Table 1 + Plots 1–4; frame-budget sweep figures
 configs/          # datasets.yaml — video roots, subset paths, summary-cache path
 scripts/          # run_bench.sbatch, gen_clip_summaries.sbatch (SLURM)
 scripts/data/     # download_videos.py, fetch_meva_videos.py, fetch_egoexo_videos.py, fetch_agibot_videos.py
@@ -109,6 +109,17 @@ python plotting/plot_results.py --jsonl results/<run>.jsonl --out-dir results/fi
 `--jsonl` accepts one or more results files (shards are pooled); `--out-dir` defaults to
 a `figs/` directory next to the first input. Writes Table 1 (`table1.md/.csv`) and
 Plots 1–4.
+
+Frame-budget sweep figures, from a pooled sweep JSONL (see `docs/stitch_frame_sweep.md`):
+
+```bash
+python -m plotting.frame_sweep_by_category      --jsonl results/<pooled>.jsonl
+python -m plotting.frame_budget_smallmultiples  --jsonl results/<pooled>.jsonl
+```
+
+Both draw each series against its own random-guessing floor, computed from the subset's
+answer-option lists by `evaluation/chance.py` (`python -m evaluation.chance` prints the
+per-category table). Figures land in `figures/frame_sweep/` as png/pdf/svg.
 
 ## Ground rules
 
