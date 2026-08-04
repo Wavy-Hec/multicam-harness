@@ -1,18 +1,18 @@
-# Ported from Wavy-Hec/CVBench bench/methods/base.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
+# Ported from Wavy-Hec/CVBench bench/methods/base.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
 """Core abstractions for the multi-camera benchmark.
 
 A ``Method`` is an *architecture* (how the camera streams are fed to a model);
 a ``Backend`` is the underlying VLM (``Backend`` and ``GenOut`` live in
 ``models.clients``). ``Method.answer(rec, video_root)`` returns a ``Result``
 carrying the prediction plus the latency / token / calibration metrics
-(M1-M4 in bench_spec.md).
+(M1-M4).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict, field
 from typing import Optional
 
-from dataloaders.qa_json import num_videos
+from dataloaders.qa_json import num_images, num_videos
 from models.clients import Backend
 
 
@@ -31,6 +31,7 @@ class Result:
     gold: str
     correct: bool
     abstained: bool
+    pair_idx: Optional[str] = None   # paired-question twin id (All-Angles-Bench IC metric)
     # 4-pass protocol (Table 1 std): a "pass" = one sampled generation (temp>0)
     # at a fixed seed, with frames held fixed; std is taken over the passes.
     pass_idx: Optional[int] = None
@@ -46,10 +47,12 @@ class Result:
     video_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
     num_model_calls: int = 1
-    # reasoning/audit (set by temporal_weighted; default None for all other methods)
+    # reasoning/audit (set by every method on success; None on legacy rows/errors)
     response_text: Optional[str] = None    # raw g.text (full <think>...<answer> trace)
     think: Optional[str] = None            # extract_think(g.text)
-    frame_alloc: Optional[dict] = None     # per-clip durations + allocated frame counts
+    frame_alloc: Optional[dict] = None     # frame-audit methods: per-clip durations +
+                                           # allocated frame counts; per_stream: the
+                                           # per-view perception_texts
     error: Optional[str] = None
 
     def to_dict(self):
@@ -64,7 +67,8 @@ def result_fields(rec):
         source=rec.get("source"),
         orig_num_cameras=rec.get("orig_num_cameras"),
         cap_answer_safe=rec.get("cap_answer_safe"),
-        num_videos=num_videos(rec),
+        num_videos=num_videos(rec) or num_images(rec),
+        pair_idx=rec.get("pair_idx") or None,
     )
 
 
