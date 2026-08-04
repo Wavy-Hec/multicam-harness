@@ -13,6 +13,17 @@ harness (no `serve_vllm.sh` here; models load in-process).
 | `stitched` | Time-synchronized frames stitched into labeled grid montages (centralized) | 1 |
 | `decentralized` | Per-stream query-conditioned text descriptions → a text-only aggregation call; `--stream-kind camera\|video` | k+1 |
 | `clip_select` | The budget is spent on question-relevant clips: cached summaries → an LLM router (`summary_select_*`), or CLIP/SigLIP thumbnail scoring (`clip_select[_<scorer>]_top<m>`) | 1–2 |
+| `frame_select` | One shared budget of the most question-relevant frames chosen **globally** across every clip, shown grouped by source clip in temporal order (`frame_select[_<scorer>]`) | 1 |
+| `blind` | The identical prompt scaffold with **zero** visual items — the text-prior floor every sighted arm must clear | 1 |
+| `single_view<i>` | Only view *i*, with the scaffold and the view's true marker unchanged; records with fewer than *i* views are skipped | 1 |
+
+All arms accept `--total-frames`, which holds the **total** frame count per question
+fixed (split evenly across its clips) instead of a flat `--nframes` per clip — use it
+whenever two harnesses are being compared, since equal frames per clip is not an equal
+budget when clip counts differ.
+
+Multi-view **still-image** records (`image_1..image_N`) are supported alongside video
+records; their prompts and montage labels say "View i" to match the question text.
 
 ## Layout
 
@@ -21,6 +32,7 @@ run_vqa.py        # CLI entry: subset × methods × backends × passes → resul
 runner.py         # run loop: sharding, resume keys, per-pass seeding
 dataloaders/      # qa_json.py (record → messages, vendored), video.py (frame sampling)
 harnesses/        # base.py + uniform.py / stitched.py / decentralized.py / clip_select.py
+                  #   + blind.py, single_view.py (controls)
 models/           # clients.py — Qwen3-VL and InternVL3 backends (InternVL import stays lazy)
 evaluation/       # scoring.py (parse_choice / gt_choice), chance.py + run metrics & summaries
 plotting/         # plot_results.py — Table 1 + Plots 1–4; frame-budget sweep figures

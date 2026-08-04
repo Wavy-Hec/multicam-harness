@@ -1,5 +1,5 @@
-# Ported from Wavy-Hec/CVBench bench/methods/stitch.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
-# Ported from Wavy-Hec/CVBench bench/methods/centralized.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
+# Ported from Wavy-Hec/CVBench bench/methods/stitch.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
+# Ported from Wavy-Hec/CVBench bench/methods/centralized.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
 """Spatial-stitching for the CENTRALIZED harness.
 
 The spec's centralized method "temporally aligns the video streams and
@@ -33,9 +33,10 @@ from PIL import Image, ImageDraw, ImageFont
 from decord import VideoReader, cpu
 
 from harnesses.base import Method, Result, result_fields
-from dataloaders.qa_json import build_messages, video_paths
+from dataloaders.qa_json import (build_messages, image_paths, letters_of,
+                                 num_images, video_paths)
 from dataloaders.video import sample_frame_indices
-from evaluation.scoring import parse_choice, gt_choice
+from evaluation.scoring import extract_think, gt_choice, parse_choice
 
 
 def decode_aligned_frames(video_paths: List[str], nframes: int) -> List[List[Optional[Image.Image]]]:
@@ -99,6 +100,21 @@ def compose_montage(frames: List[Optional[Image.Image]], labels: List[str],
     return canvas
 
 
+def build_image_montage(image_paths: List[str], cell_px: int = 448,
+                        label_prefix: str = "View") -> List[Image.Image]:
+    """Still-image variant: tile the K view images of one question into a single
+    labeled grid montage (no temporal axis — T=1 by construction). A view that
+    fails to open becomes a black cell, mirroring decode_aligned_frames."""
+    frames: List[Optional[Image.Image]] = []
+    for ip in image_paths:
+        try:
+            frames.append(Image.open(ip).convert("RGB"))
+        except Exception:
+            frames.append(None)
+    labels = [f"{label_prefix} {i + 1}" for i in range(len(image_paths))]
+    return [compose_montage(frames, labels, cell_w=cell_px, cell_h=cell_px)]
+
+
 def build_montages(video_paths: List[str], nframes: int = 8, T: Optional[int] = None,
                    cell_px: int = 448, label_prefix: str = "Camera") -> List[Image.Image]:
     """Decode the K clips and compose ``T`` grid montages (one per aligned timestep).
@@ -126,7 +142,7 @@ MONTAGE_PREFIX_CAMERA = (
     "view(s), shown in chronological order. Each montage tiles the cameras into a "
     "grid; every cell is labeled 'Camera i' (top-left). Reason across the views and "
     "over time to answer.")
-# "video" — CVBench-style INDEPENDENT clips (corrected preamble: matches the
+# "video" — INDEPENDENT clips (corrected preamble: matches the
 # 'Video i' labels used in the question, and does not falsely call them synchronized).
 MONTAGE_PREFIX_VIDEO = (
     "The following {T} image(s) are grid montages built from {k} independent video "
@@ -134,8 +150,16 @@ MONTAGE_PREFIX_VIDEO = (
     "tiles the {k} clips into a grid; every cell is labeled 'Video i' (top-left), "
     "corresponding to Video 1..Video {k} in the question. Reason about each Video "
     "separately as well as together, and over time, to answer.")
-MONTAGE_PREFIXES = {"camera": MONTAGE_PREFIX_CAMERA, "video": MONTAGE_PREFIX_VIDEO}
-MONTAGE_LABELS = {"camera": "Camera", "video": "Video"}
+# "view" — still-image multi-view (All-Angles-Bench style): one montage of the K
+# simultaneous view images; labels match the question text's "View 1..View k".
+MONTAGE_PREFIX_VIEW = (
+    "The following image is a grid montage of {k} camera views of the same scene, "
+    "captured at the same moment. Every cell is labeled 'View i' (top-left), "
+    "corresponding to View 1..View {k} in the question. Reason across the views "
+    "to answer.")
+MONTAGE_PREFIXES = {"camera": MONTAGE_PREFIX_CAMERA, "video": MONTAGE_PREFIX_VIDEO,
+                    "view": MONTAGE_PREFIX_VIEW}
+MONTAGE_LABELS = {"camera": "Camera", "video": "Video", "view": "View"}
 MONTAGE_PREFIX = MONTAGE_PREFIX_CAMERA  # backward-compat alias
 
 
@@ -143,10 +167,15 @@ class CentralizedMethod(Method):
     name = "centralized"
 
     def __init__(self, backend, nframes=8, max_new_tokens=8192, temperature=0.0,
-                 montage_frames=0, cell_px=448, montage_kind="camera"):
+                 montage_frames=0, cell_px=448, montage_kind="camera",
+                 total_frames=0):
         super().__init__(backend, nframes=nframes, max_new_tokens=max_new_tokens,
                          temperature=temperature)
         self.T = montage_frames if montage_frames and montage_frames > 0 else nframes
+        # total_frames > 0: hold the TOTAL source-frame count (T montages x K
+        # cells) fixed per question by setting T = round(total/K) per record
+        # (the mentor's fixed-budget protocol)
+        self.total_frames = total_frames
         self.cell_px = cell_px
         self.montage_kind = montage_kind  # "camera" (synced views) | "video" (independent clips)
         self._prefix = MONTAGE_PREFIXES[montage_kind]
@@ -159,32 +188,49 @@ class CentralizedMethod(Method):
             return self._cache[key]
         base_msgs, yn = build_messages(rec, video_root, self.nframes, no_video=True)
         scaffold = base_msgs[0]["content"][0]["text"]
-        paths = video_paths(rec, video_root)
-        montages = build_montages(paths, nframes=self.nframes, T=self.T, cell_px=self.cell_px,
-                                  label_prefix=self._label)
-        gold = gt_choice(rec["answer"], yn)
-        self._cache = {key: (montages, scaffold, yn, gold, len(paths))}  # keep only last rec
+        if num_images(rec) > 0:
+            # still-image record: one montage of the view images; labels/preamble
+            # are forced to "View" to match the question text regardless of
+            # --montage-kind (using "Camera i" here is a known labeling artifact)
+            paths = image_paths(rec, video_root)
+            montages = build_image_montage(paths, cell_px=self.cell_px, label_prefix="View")
+            prefix = MONTAGE_PREFIX_VIEW
+            alloc = {"kind": "image_montage", "K": len(paths)}
+        else:
+            paths = video_paths(rec, video_root)
+            t = self.T
+            if self.total_frames:
+                t = max(1, round(self.total_frames / len(paths)))
+            montages = build_montages(paths, nframes=max(self.nframes, t), T=t,
+                                      cell_px=self.cell_px, label_prefix=self._label)
+            prefix = self._prefix
+            alloc = {"kind": "montage", "T": t, "K": len(paths),
+                     "frames_total": t * len(paths),
+                     "total_frames": self.total_frames or None}
+        gold = gt_choice(rec["answer"], yn, letters=letters_of(rec))
+        self._cache = {key: (montages, scaffold, yn, gold, len(paths), prefix, alloc)}  # last rec only
         return self._cache[key]
 
     def answer(self, rec, video_root, seed=None) -> Result:
         f = result_fields(rec)
+        letters = letters_of(rec)
         try:
-            montages, scaffold, yn, gold, k = self._prepare(rec, video_root)
+            montages, scaffold, yn, gold, k, prefix, alloc = self._prepare(rec, video_root)
         except Exception as e:
             gold = gt_choice(rec["answer"], all(o.strip().strip(".").lower() in ("yes", "no")
-                                                for o in rec["options"]))
+                                                for o in rec["options"]), letters=letters)
             return Result(**f, method=self.name, backend=self.backend.name,
                           prediction="", gold=gold, correct=False, abstained=True,
                           pass_idx=None, seed=seed, temperature=self.temperature,
                           num_model_calls=1, error=f"stitch:{type(e).__name__}: {e}")
-        content = [{"type": "text", "text": self._prefix.format(T=len(montages), k=k)}]
+        content = [{"type": "text", "text": prefix.format(T=len(montages), k=k)}]
         content += [{"type": "image", "image": m} for m in montages]
         content += [{"type": "text", "text": scaffold}]
         messages = [{"role": "user", "content": content}]
         try:
             g = self.backend.generate(messages, max_new_tokens=self.max_new_tokens,
                                       seed=seed, temperature=self.temperature)
-            pred = parse_choice(g.text, yn)
+            pred = parse_choice(g.text, yn, letters=letters)
             return Result(
                 **f, method=self.name, backend=self.backend.name,
                 prediction=pred, gold=gold,
@@ -194,6 +240,8 @@ class CentralizedMethod(Method):
                 latency_s=g.latency_s,
                 input_tokens=g.input_tokens, video_tokens=g.video_tokens,
                 output_tokens=g.output_tokens, num_model_calls=1,
+                response_text=g.text, think=extract_think(g.text),
+                frame_alloc=alloc,
             )
         except Exception as e:  # keep the sweep alive; record the failure
             return Result(**f, method=self.name, backend=self.backend.name,

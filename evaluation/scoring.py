@@ -1,4 +1,4 @@
-# Ported from Wavy-Hec/CVBench Video-R1/src/eval_thinking.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
+# Ported from Wavy-Hec/CVBench Video-R1/src/eval_thinking.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
 # Ported from Wavy-Hec/CVBench bench/metrics.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
 """Answer scoring + benchmark metric aggregation.
 
@@ -11,6 +11,7 @@ The rest aggregates per-question Result rows into the benchmark metrics (M1-M4).
 Pure-stdlib (no numpy) so it runs anywhere, including the login node for the
 CPU scoring-validation gate.
 """
+import functools
 import re
 from collections import defaultdict
 from statistics import mean as _mean, pstdev as _pstdev
@@ -37,16 +38,21 @@ def extract_answer(text):
 # (closest to the model's conclusion). Scanning the whole trace for any bare
 # A/B/C/D is wrong: it grabs prose like "a vehicle" / "options A to D", which
 # fabricated a lucky 'A' on truncated runs and made 0/20 structural.
-_CONCLUDE_MC = re.compile(
-    r"(?i)(?:final\s+answer|best\s+answer|correct\s+answer|the\s+answer|answer)\s*"
-    r"(?:is|:|=|would\s+be)?\s*\(?([ABCD])\b"
-)
+@functools.lru_cache(maxsize=None)
+def _conclude_mc_re(letters):
+    return re.compile(
+        r"(?i)(?:final\s+answer|best\s+answer|correct\s+answer|the\s+answer|answer)\s*"
+        r"(?:is|:|=|would\s+be)?\s*\(?([" + letters + r"])\b"
+    )
+
+
+_CONCLUDE_MC = _conclude_mc_re("ABCD")
 _CONCLUDE_YN = re.compile(
     r"(?i)(?:final\s+answer|the\s+answer|answer)\s*(?:is|:|=)?\s*\(?(yes|no)\b"
 )
 
 
-def parse_choice(text, is_yesno):
+def parse_choice(text, is_yesno, letters="ABCD"):
     """Final answer = <answer>..</answer> if present. If the tag is missing
     (e.g. a truncated trace), fall back ONLY to an explicit "the answer is X"
     conclusion (last match); otherwise abstain (return "") rather than grabbing
@@ -59,17 +65,17 @@ def parse_choice(text, is_yesno):
         ms = list(_CONCLUDE_YN.finditer(text))
         return ms[-1].group(1).capitalize() if ms else ""
     if ans:
-        m = re.search(r"(?i)\b([ABCD])\b", ans)
+        m = re.search(r"(?i)\b([" + letters + r"])\b", ans)
         return m.group(1).upper() if m else ans.strip()
-    ms = list(_CONCLUDE_MC.finditer(text))
+    ms = list(_conclude_mc_re(letters).finditer(text))
     return ms[-1].group(1).upper() if ms else ""
 
 
-def gt_choice(answer, is_yesno):
+def gt_choice(answer, is_yesno, letters="ABCD"):
     a = answer.strip()
     if is_yesno:
         return a.capitalize()
-    m = re.search(r"(?i)([ABCD])", a)
+    m = re.search(r"(?i)([" + letters + r"])", a)
     return m.group(1).upper() if m else a.upper()
 
 

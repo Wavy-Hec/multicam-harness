@@ -1,4 +1,4 @@
-# Ported from Wavy-Hec/CVBench bench/run_bench.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
+# Ported from Wavy-Hec/CVBench bench/run_bench.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
 """Run the multi-camera benchmark: methods x backends x passes over a subset.
 
 Usage (from repo root):
@@ -25,7 +25,10 @@ import yaml
 from harnesses.stitched import CentralizedMethod
 from harnesses.decentralized import PerStreamMethod
 from harnesses.uniform import CVBenchNativeMethod, TemporalWeightedMethod
-from harnesses.clip_select import SummarySelectMethod, ClipScoreSelectMethod
+from harnesses.blind import BlindMethod
+from harnesses.single_view import SingleViewMethod
+from harnesses.clip_select import (SummarySelectMethod, ClipScoreSelectMethod,
+                                   FrameSelectMethod)
 from models.clients import make_backend
 import runner
 
@@ -49,9 +52,10 @@ DEFAULT_SUMMARIES = _CFG.get("summaries_cache") or "results/clip_summaries_inter
 METHODS = {"centralized": CentralizedMethod, "per_stream": PerStreamMethod,
            "cvbench_native": CVBenchNativeMethod,
            "temporal_weighted": TemporalWeightedMethod,
+           "blind": BlindMethod,
            # (adaptive_content / adaptive_query — the within-clip frame-selection
-           # ablation — were retired 2026-07-02 after losing/tying uniform; see
-           # analysis/adaptive_frames_experiment.md §B for the archived result.)
+           # ablation — were retired 2026-07-02 after losing/tying uniform; the
+           # archived result lives in the fork's git history.)
            # D3 clip selection: spend the budget on the clips a question needs.
            # summary_select_* = cached per-clip summaries -> one text-only
            # selector call (route may answer ALL; top1 forces one clip);
@@ -65,6 +69,12 @@ METHODS = {"centralized": CentralizedMethod, "per_stream": PerStreamMethod,
 # clip_select_top2, clip_select_siglip_top1. The matched string becomes the
 # method's recorded name, so scorer variants never collide in rows/resume keys.
 CLIP_SELECT_RE = re.compile(r"^clip_select(?:_(?P<tag>[a-z0-9]+))?_top(?P<m>\d+)$")
+# single_view<i>: feed only view/clip i (harnesses/single_view.py); records with
+# fewer than i views are skipped, so single_view1..13 sweeps a mixed-K pool.
+SINGLE_VIEW_RE = re.compile(r"^single_view(?P<i>\d+)$")
+# frame_select: global top-budget frame selection across ALL clips (optional
+# scorer tag, e.g. frame_select_siglip); the budget comes from --budget.
+FRAME_SELECT_RE = re.compile(r"^frame_select(?:_(?P<tag>[a-z0-9]+))?$")
 SCORER_ALIASES = {"siglip": "google/siglip-so400m-patch14-384",
                   "siglip2": "google/siglip2-so400m-patch14-384"}
 
@@ -75,12 +85,26 @@ def make_method(mname, backend, args):
                                  max_new_tokens=args.max_new_tokens,
                                  temperature=args.temperature,
                                  montage_frames=args.montage_frames, cell_px=args.cell_px,
-                                 montage_kind=args.montage_kind)
+                                 montage_kind=args.montage_kind,
+                                 total_frames=args.total_frames)
     if mname == "per_stream":
         return PerStreamMethod(backend, nframes=args.nframes,
                                max_new_tokens=args.max_new_tokens,
                                temperature=args.temperature,
-                               stream_kind=args.stream_kind)
+                               perception_max_new_tokens=args.perception_max_new_tokens,
+                               stream_kind=args.stream_kind,
+                               total_frames=args.total_frames)
+    if mname == "cvbench_native":
+        return CVBenchNativeMethod(backend, nframes=args.nframes,
+                                   max_new_tokens=args.max_new_tokens,
+                                   temperature=args.temperature,
+                                   total_frames=args.total_frames)
+    sv = SINGLE_VIEW_RE.match(mname)
+    if sv:
+        return SingleViewMethod(backend, view_idx=int(sv.group("i")),
+                                nframes=args.nframes,
+                                max_new_tokens=args.max_new_tokens,
+                                temperature=args.temperature, name=mname)
     if mname == "temporal_weighted":
         return TemporalWeightedMethod(backend, budget=args.budget, floor=args.floor,
                                       weighting=args.weighting, nframes=args.nframes,
@@ -92,6 +116,19 @@ def make_method(mname, backend, args):
             mode=mname.rsplit("_", 1)[1], budget=args.budget, floor=args.floor,
             sel_max_new_tokens=args.sel_max_new_tokens, nframes=args.nframes,
             max_new_tokens=args.max_new_tokens, temperature=args.temperature)
+    fm = FRAME_SELECT_RE.match(mname)
+    if fm:
+        tag = fm.group("tag")
+        if tag and tag not in SCORER_ALIASES:
+            raise SystemExit(f"unknown frame_select scorer tag '{tag}'. "
+                             f"Known: {list(SCORER_ALIASES)}")
+        return FrameSelectMethod(
+            backend, budget=args.budget,
+            candidates_per_video=args.frame_candidates,
+            clip_model=SCORER_ALIASES[tag] if tag else args.clip_model,
+            cell_px=args.cell_px, name=mname,
+            nframes=args.nframes, max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature)
     mm = CLIP_SELECT_RE.match(mname)
     if mm:
         tag = mm.group("tag")
@@ -118,11 +155,18 @@ def main():
     ap.add_argument("--video-root", default=DEFAULT_VIDEO_ROOT)
     ap.add_argument("--nframes", type=int, default=8)
     ap.add_argument("--max-new-tokens", type=int, default=8192)
+    ap.add_argument("--perception-max-new-tokens", type=int, default=1024,
+                    help="per_stream: token cap for each per-view perception call "
+                         "(1024 truncates thinking backends mid-<think>; raise for those)")
     ap.add_argument("--passes", type=int, default=4, help="independent sampled passes for std")
     ap.add_argument("--seeds", default="1,2,3,4", help="comma seeds; len must cover --passes")
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--budget", type=int, default=64,
                     help="temporal_weighted: TOTAL frames per question, split across clips")
+    ap.add_argument("--total-frames", type=int, default=0,
+                    help="centralized/cvbench_native/per_stream: hold the TOTAL frame "
+                         "count per question fixed (split evenly across its clips) "
+                         "instead of a flat --nframes per clip; 0 = off")
     ap.add_argument("--floor", type=int, default=2,
                     help="temporal_weighted: per-clip minimum frames")
     ap.add_argument("--weighting", default="duration", choices=["duration", "even"],
@@ -141,6 +185,9 @@ def main():
     ap.add_argument("--sel-stat", default="max", choices=["max", "mean"],
                     help="clip_select_*: rank clips by max- or mean-over-thumbnails "
                          "similarity (both are recorded in frame_alloc regardless)")
+    ap.add_argument("--frame-candidates", type=int, default=32,
+                    help="frame_select: uniform candidate frames decoded PER clip; "
+                         "the global top-(--budget) across all clips' candidates is kept")
     ap.add_argument("--sel-max-new-tokens", type=int, default=512,
                     help="summary_select_*: token cap for the selector call")
     ap.add_argument("--montage-frames", type=int, default=0,
@@ -161,7 +208,8 @@ def main():
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
-    runner.run(args, METHODS, CLIP_SELECT_RE, make_backend, make_method)
+    runner.run(args, METHODS, (CLIP_SELECT_RE, FRAME_SELECT_RE, SINGLE_VIEW_RE),
+               make_backend, make_method)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ over methods -> records -> passes (answer, append JSONL, flush), and the
 summary/report tail.
 
 Split minimally out of the fork's ``bench/run_bench.py`` ``main()``: run_vqa.py
-owns the argparse block and calls ``run(args, METHODS, CLIP_SELECT_RE,
+owns the argparse block and calls ``run(args, METHODS, NAME_RES,
 make_backend, make_method)``; ``run`` is the remainder of ``main()`` from the
 ``data = json.load(...)`` line onward, byte-identical apart from the default
 results path being rooted at ``results/`` instead of the fork's module dir.
@@ -29,7 +29,7 @@ def load_done(path):
     return done
 
 
-def run(args, METHODS, CLIP_SELECT_RE, make_backend, make_method):
+def run(args, METHODS, NAME_RES, make_backend, make_method):
     data = json.load(open(args.subset))
     if args.chunk and args.chunk > 1:
         data = data[args.offset::args.chunk]
@@ -37,10 +37,14 @@ def run(args, METHODS, CLIP_SELECT_RE, make_backend, make_method):
         data = data[: args.limit]
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
+    # NAME_RES: one compiled regex, or an iterable of them, covering the
+    # generated method names (clip_select_*, frame_select*, single_view<i>)
+    name_res = [NAME_RES] if hasattr(NAME_RES, "match") else list(NAME_RES)
     for m in methods:
-        if m not in METHODS and not CLIP_SELECT_RE.match(m):
+        if m not in METHODS and not any(r.match(m) for r in name_res):
             raise SystemExit(f"unknown method '{m}'. Known: {list(METHODS)} "
-                             f"or clip_select[_<scorer>]_top<m>")
+                             f"or clip_select[_<scorer>]_top<m> / "
+                             f"frame_select[_<scorer>] / single_view<i>")
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()][: args.passes]
     if len(seeds) < args.passes:
         raise SystemExit(f"need >= {args.passes} seeds, got {seeds}")
@@ -71,6 +75,8 @@ def run(args, METHODS, CLIP_SELECT_RE, make_backend, make_method):
                         if (rec["id"], method.name, backend.name, pi) not in done]
                 for rec, pass_idx, seed in tqdm(jobs, desc=f"{mname}/{backend.name}"):
                     res = method.answer(rec, args.video_root, seed=seed)
+                    if res is None:  # single_view<i> on a record with < i views
+                        continue
                     res.pass_idx = pass_idx
                     fh.write(json.dumps(res.to_dict(), ensure_ascii=False) + "\n")
                     fh.flush()
