@@ -1,7 +1,7 @@
-# Ported from Wavy-Hec/CVBench bench/methods/base.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
-# Ported from Wavy-Hec/CVBench bench/backends/qwen.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
-# Ported from Wavy-Hec/CVBench bench/backends/internvl.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
-# Ported from Wavy-Hec/CVBench Video-R1/src/eval_thinking.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
+# Ported from Wavy-Hec/CVBench bench/methods/base.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
+# Ported from Wavy-Hec/CVBench bench/backends/qwen.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
+# Ported from Wavy-Hec/CVBench bench/backends/internvl.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
+# Ported from Wavy-Hec/CVBench Video-R1/src/eval_thinking.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
 # Ported from Wavy-Hec/CVBench bench/run_bench.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
 """VLM backends for the multi-camera harness.
 
@@ -107,6 +107,7 @@ class QwenBackend(Backend):
         from qwen_vl_utils import process_vision_info
         self._pvi = process_vision_info
         self._vid_id = self.processor.tokenizer.convert_tokens_to_ids("<|video_pad|>")
+        self._img_id = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
 
     def generate(self, messages, max_new_tokens, *, seed=None, temperature=0.0) -> GenOut:
         proc = self.processor
@@ -123,6 +124,8 @@ class QwenBackend(Backend):
                       return_tensors="pt", **video_kwargs).to(self.model.device)
         total = int(inputs.input_ids.shape[1])
         vid = int((inputs.input_ids[0] == self._vid_id).sum())
+        if self._img_id is not None:
+            vid += int((inputs.input_ids[0] == self._img_id).sum())
         do_sample = temperature is not None and temperature > 0
         if do_sample and seed is not None:
             torch.manual_seed(seed)
@@ -303,7 +306,11 @@ class InternVL3Backend(Backend):
             if t == "text":
                 parts.append(item["text"])
             elif t == "image":
-                px = load_image(item["image"], input_size=448, max_num=self.max_tiles)
+                from PIL import Image as _PILImage
+                img = item["image"]
+                if isinstance(img, str):
+                    img = _PILImage.open(img).convert("RGB")
+                px = load_image(img, input_size=448, max_num=self.max_tiles)
                 pixel_chunks.append(px)
                 npl.append(px.shape[0])
                 parts.append("<image>\n")
@@ -330,9 +337,14 @@ class InternVL3Backend(Backend):
         if do_sample:
             gen_cfg.update(temperature=temperature, top_p=0.9)
         t0 = time.perf_counter()
-        with torch.no_grad():
-            response = self.model.chat(self.tokenizer, pixel_values, question, gen_cfg,
-                                       num_patches_list=npl, history=None, return_history=True)[0]
+        try:
+            with torch.no_grad():
+                response = self.model.chat(self.tokenizer, pixel_values, question, gen_cfg,
+                                           num_patches_list=npl, history=None, return_history=True)[0]
+        except torch.cuda.OutOfMemoryError:
+            # hand the next (smaller) question a clean allocator
+            torch.cuda.empty_cache()
+            raise
         dt = time.perf_counter() - t0
 
         # best-effort token accounting (not directly comparable to Qwen's <|video_pad|>):
