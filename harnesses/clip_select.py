@@ -1,4 +1,4 @@
-# Ported from Wavy-Hec/CVBench bench/methods/clip_select.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
+# Ported from Wavy-Hec/CVBench bench/methods/clip_select.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
 # Deliberate delta vs source: gen_clip_summaries references updated from the
 # fork's `bench/gen_clip_summaries.py` module path to this repo's
 # `scripts/gen_clip_summaries.py` (docstring, comment, and SystemExit hint).
@@ -16,7 +16,7 @@ budget on the selected clips only. Two selector families, three method arms:
                          baseline is attributable to the questions it pruned.
 
   summary_select_top1    Same summaries + selector, but forced to pick exactly
-                         ONE clip. Only ~4% of CVBench questions name a single
+                         ONE clip. Typically only a small share of questions name a single
                          video, so this arm is a DIAGNOSTIC of what hard
                          pruning costs, not a candidate winner.
 
@@ -56,7 +56,7 @@ from harnesses.base import Method, Result, result_fields
 # PREFIX/MARKER/SPLIT_DESC are imported verbatim, and the budget split over
 # the selected clips reuses allocate_frames.
 from harnesses.uniform import allocate_frames, PREFIX, MARKER, SPLIT_DESC
-from dataloaders.qa_json import build_messages, video_paths
+from dataloaders.qa_json import build_messages, letters_of, video_paths
 from evaluation.scoring import parse_choice, gt_choice, extract_think
 
 
@@ -69,17 +69,25 @@ def clip_scores(clip_bundle, text, pil_frames, batch=32):
     analysis/adaptive_frames_experiment.md §B.)"""
     import torch
     model, proc, device = clip_bundle
+    # transformers <5 returns the projected embedding tensor directly from
+    # get_{text,image}_features; >=5 (the cvbench env) returns a ModelOutput
+    # whose .pooler_output IS that projected embedding (verified identical to
+    # the forward image_embeds/text_embeds path). Coerce so scoring works in
+    # both envs — otherwise the .norm() call raises and callers silently fall
+    # back to uniform sampling.
+    def _emb(x):
+        return x if hasattr(x, "norm") else x.pooler_output
     # SigLIP was trained with fixed 64-token max_length padding; CLIP with
     # dynamic padding. Mismatched padding shifts SigLIP text embeddings.
     pad = "max_length" if getattr(model.config, "model_type", "") == "siglip" else True
     tok = proc(text=[text], return_tensors="pt", padding=pad, truncation=True).to(device)
     with torch.no_grad():
-        t_emb = model.get_text_features(**tok)
+        t_emb = _emb(model.get_text_features(**tok))
         t_emb = t_emb / t_emb.norm(dim=-1, keepdim=True)
         sims = []
         for i in range(0, len(pil_frames), batch):
             chunk = proc(images=pil_frames[i:i + batch], return_tensors="pt").to(device)
-            i_emb = model.get_image_features(**chunk)
+            i_emb = _emb(model.get_image_features(**chunk))
             i_emb = i_emb / i_emb.norm(dim=-1, keepdim=True)
             sims.append((i_emb @ t_emb.T).squeeze(1).float().cpu().numpy())
     return np.concatenate(sims)
@@ -143,6 +151,21 @@ SELECTOR_TOP1_PROMPT = (
     "Options:\n{options}\n\nWhich single video is the most relevant to this "
     "question? Do NOT answer the question itself. Reply with exactly one "
     "line:\nBEST: <one video number>")
+
+# Answer-stage preamble for frame_select: the budget is spent on the single most
+# relevant frames pooled ACROSS all clips (not on whole clips). Frames keep their
+# source Video's ORIGINAL number and are shown in temporal order within each.
+FRAME_SELECT_PREFIX = (
+    "The question below refers to {K} INDEPENDENT video clips (different, "
+    "unrelated scenes), numbered Video 1 to Video {K}. From across ALL of them, "
+    "the {n} frames most relevant to the question were selected — a single shared "
+    "budget of {budget} frames chosen GLOBALLY across every clip, not a fixed "
+    "number per clip. They are shown below grouped by their source Video and in "
+    "temporal order within each Video; a banner '=== Video k ===' precedes each "
+    "Video's selected frames. Clips that contributed no selected frames are "
+    "omitted. Reason over the shown frames to answer.")
+FRAME_MARKER = ("=== Video {orig} — {cnt} frame(s) selected (its most relevant to "
+                "the question) ===")
 
 
 # --------------------------------------------------------------------------- #
@@ -257,7 +280,7 @@ def _clip_meta(vp):
 
 def _rel_keys(rec):
     """The record's raw video_1..4 values, in video_paths() order — the summary
-    cache keys (they match analysis/cvbench_all_videos.txt lines exactly)."""
+    cache keys (they match the summary manifest lines exactly)."""
     return [rec.get(f"video_{i}") for i in range(1, 5) if rec.get(f"video_{i}")]
 
 
@@ -402,7 +425,8 @@ class SummarySelectMethod(Method):
 
         content, nframes = present_selected(paths, durs, ncaps, sel_idx,
                                             self.budget, self.floor, scaffold)
-        gold = gt_choice(rec["answer"], yn)
+        letters = letters_of(rec)
+        gold = gt_choice(rec["answer"], yn, letters=letters)
         alloc_meta = {
             "budget": self.budget,
             "floor": self.floor,
@@ -420,11 +444,12 @@ class SummarySelectMethod(Method):
 
     def answer(self, rec, video_root, seed=None) -> Result:
         f = result_fields(rec)
+        letters = letters_of(rec)
         try:
             content, yn, gold, alloc_meta = self._prepare(rec, video_root)
         except Exception as e:
             gold = gt_choice(rec["answer"], all(o.strip().strip(".").lower() in ("yes", "no")
-                                                for o in rec["options"]))
+                                                for o in rec["options"]), letters=letters)
             return Result(**f, method=self.name, backend=self.backend.name,
                           prediction="", gold=gold, correct=False, abstained=True,
                           seed=seed, temperature=self.temperature, num_model_calls=1,
@@ -433,7 +458,7 @@ class SummarySelectMethod(Method):
         try:
             g = self.backend.generate(messages, max_new_tokens=self.max_new_tokens,
                                       seed=seed, temperature=self.temperature)
-            pred = parse_choice(g.text, yn)
+            pred = parse_choice(g.text, yn, letters=letters)
             return Result(
                 **f, method=self.name, backend=self.backend.name,
                 prediction=pred, gold=gold,
@@ -536,7 +561,8 @@ class ClipScoreSelectMethod(Method):
 
         content, nframes = present_selected(paths, durs, ncaps, sel_idx,
                                             self.budget, self.floor, scaffold)
-        gold = gt_choice(rec["answer"], yn)
+        letters = letters_of(rec)
+        gold = gt_choice(rec["answer"], yn, letters=letters)
         alloc_meta = {
             "budget": self.budget,
             "floor": self.floor,
@@ -558,4 +584,143 @@ class ClipScoreSelectMethod(Method):
         return self._cache[key]
 
     # identical answer skeleton to SummarySelectMethod / temporal_weighted
+    answer = SummarySelectMethod.answer
+
+
+# --------------------------------------------------------------------------- #
+class FrameSelectMethod(Method):
+    """GLOBAL frame selection: pool candidate frames from ALL clips, score each
+    against the question (CLIP/SigLIP), and keep the top-``budget`` frames across
+    the entire union — 'the best 64 frames across all videos', as opposed to
+    ClipScoreSelectMethod's 'pick the best video(s), then sample within them'.
+
+    The selected frames are presented grouped by their source Video (original
+    numbering preserved) in temporal order, so a clip may contribute many frames,
+    a few, or none depending on how relevant its content is. Frames are fed as
+    images (resized to <=cell_px), so on InternVL keep max_tiles=1 to stay within
+    context. Selection is deterministic (CLIP scores) and cached across the 4
+    passes so the std isolates the answer stage.
+    """
+    name = "frame_select"
+
+    def __init__(self, backend, budget=64, candidates_per_video=32,
+                 clip_model="openai/clip-vit-base-patch32", cell_px=448,
+                 nframes=8, max_new_tokens=8192, temperature=0.0, name=None):
+        super().__init__(backend, nframes=nframes, max_new_tokens=max_new_tokens,
+                         temperature=temperature)
+        self.budget = int(budget)
+        self.candidates_per_video = int(candidates_per_video)
+        self.clip_model_name = clip_model
+        self.cell_px = int(cell_px)
+        self.name = name or "frame_select"
+        self._cache = {}
+        self._clip = None
+
+    def _ensure_clip(self):
+        if self._clip is None:
+            from transformers import AutoModel, AutoProcessor
+            dev = getattr(self.backend, "device", "cuda:0")
+            model = AutoModel.from_pretrained(self.clip_model_name).to(dev).eval()
+            proc = AutoProcessor.from_pretrained(self.clip_model_name)
+            self._clip = (model, proc, dev)
+        return self._clip
+
+    def _candidates(self, vp):
+        """Up to candidates_per_video uniform (time_s, PIL) frames, or [] on
+        decode failure — the pool this clip contributes to the global ranking."""
+        from PIL import Image
+        try:
+            vr = VideoReader(vp, ctx=cpu(0), num_threads=1)
+            n = len(vr)
+            if n <= 0:
+                return []
+            fps = float(vr.get_avg_fps())
+            k = min(self.candidates_per_video, n)
+            idx = sorted({min(n - 1, int((j + 0.5) * n / k)) for j in range(k)})
+            frames = vr.get_batch(idx).asnumpy()
+            return [((fi / fps) if fps > 0 else None,
+                     Image.fromarray(fr).convert("RGB")) for fi, fr in zip(idx, frames)]
+        except Exception:
+            return []
+
+    def _resize(self, im):
+        w, h = im.size
+        s = self.cell_px / max(w, h)
+        if s < 1.0:
+            im = im.resize((max(1, int(w * s)), max(1, int(h * s))))
+        return im
+
+    def _prepare(self, rec, video_root):
+        key = rec.get("id")
+        if key in self._cache:
+            return self._cache[key]
+        base_msgs, yn = build_messages(rec, video_root, self.nframes, no_video=True)
+        scaffold = base_msgs[0]["content"][0]["text"]
+        paths = video_paths(rec, video_root)
+        K = len(paths)
+
+        # pool candidate frames across ALL clips, tagged by source video (1-based)
+        pool, per_video_cand = [], []
+        for i, vp in enumerate(paths, 1):
+            cands = self._candidates(vp)
+            per_video_cand.append(len(cands))
+            for t, im in cands:
+                pool.append((i, t, im))
+
+        fallback = None
+        if not pool:
+            sel = []
+            fallback = "fallback:no_frames"
+        else:
+            question = rec.get("question", "")
+            try:
+                scores = clip_scores(self._ensure_clip(), question, [im for _, _, im in pool])
+            except Exception as e:
+                scores = None
+                score_err = f"{type(e).__name__}: {e}"
+            if scores is None:                        # scoring failed -> uniform stride
+                fallback = f"fallback:score_error:{score_err}"
+                step = max(1, len(pool) // self.budget)
+                order = list(range(0, len(pool), step))
+            else:
+                order = sorted(range(len(pool)), key=lambda j: -float(scores[j]))
+            keep = order[:self.budget]
+            sel = [(pool[j][0], pool[j][1], pool[j][2],
+                    float(scores[j]) if scores is not None else None) for j in keep]
+
+        # group selected by source video, temporal order within each
+        by_video = {}
+        for vidx, t, im, sc in sel:
+            by_video.setdefault(vidx, []).append((t, im, sc))
+        for v in by_video:
+            by_video[v].sort(key=lambda x: (x[0] if x[0] is not None else 0.0))
+
+        n_sel = len(sel)
+        content = [{"type": "text", "text": FRAME_SELECT_PREFIX.format(
+            K=K, n=n_sel, budget=self.budget)}]
+        for v in sorted(by_video):
+            content.append({"type": "text",
+                            "text": FRAME_MARKER.format(orig=v, cnt=len(by_video[v]))})
+            for t, im, sc in by_video[v]:
+                content.append({"type": "image", "image": self._resize(im)})
+        content.append({"type": "text", "text": scaffold})
+
+        letters = letters_of(rec)
+        gold = gt_choice(rec["answer"], yn, letters=letters)
+        alloc_meta = {
+            "budget": self.budget,
+            "K": K,
+            "candidates_per_video": self.candidates_per_video,
+            "n_candidates": len(pool),
+            "n_selected": n_sel,
+            "selected_per_video": {v: len(by_video[v]) for v in sorted(by_video)},
+            "candidates_decoded_per_video": per_video_cand,
+            "selection_fallback": fallback,
+            "clip_model": self.clip_model_name,
+            "selected_times_s": {v: [round(t, 2) if t is not None else None
+                                     for t, _, _ in by_video[v]] for v in sorted(by_video)},
+        }
+        self._cache = {key: (content, yn, gold, alloc_meta)}
+        return self._cache[key]
+
     answer = SummarySelectMethod.answer
