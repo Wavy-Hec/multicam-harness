@@ -1,6 +1,6 @@
-# Ported from Wavy-Hec/CVBench bench/methods/temporal.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
-# Ported from Wavy-Hec/CVBench bench/methods/cvbench_native.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
-"""TEMPORAL-WEIGHTED harness: the K (<=4) independent CVBench clips of one
+# Ported from Wavy-Hec/CVBench bench/methods/temporal.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
+# Ported from Wavy-Hec/CVBench bench/methods/cvbench_native.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
+"""TEMPORAL-WEIGHTED harness: the K independent clips of one
 question are presented to ONE model SEQUENTIALLY (clip 1, then clip 2, ...), with
 a single TOTAL frame budget split across the clips IN PROPORTION TO EACH CLIP'S
 DURATION (longer clips get more frames). Within each clip the frames are sampled
@@ -35,7 +35,7 @@ import math
 from decord import VideoReader, cpu
 
 from harnesses.base import Method, Result, result_fields
-from dataloaders.qa_json import build_messages, video_paths
+from dataloaders.qa_json import build_messages, letters_of, video_paths
 from evaluation.scoring import parse_choice, gt_choice, extract_think
 
 PREFIX = (
@@ -195,7 +195,8 @@ class TemporalWeightedMethod(Method):
             content.append({"type": "video", "video": vp, "nframes": n_k})
         content.append({"type": "text", "text": scaffold})
 
-        gold = gt_choice(rec["answer"], yn)
+        letters = letters_of(rec)
+        gold = gt_choice(rec["answer"], yn, letters=letters)
         alloc_meta = {
             "weighting": self.weighting,
             "budget": self.budget,
@@ -210,11 +211,12 @@ class TemporalWeightedMethod(Method):
 
     def answer(self, rec, video_root, seed=None) -> Result:
         f = result_fields(rec)
+        letters = letters_of(rec)
         try:
             content, yn, gold, alloc_meta = self._prepare(rec, video_root)
         except Exception as e:
             gold = gt_choice(rec["answer"], all(o.strip().strip(".").lower() in ("yes", "no")
-                                                for o in rec["options"]))
+                                                for o in rec["options"]), letters=letters)
             return Result(**f, method=self.name, backend=self.backend.name,
                           prediction="", gold=gold, correct=False, abstained=True,
                           seed=seed, temperature=self.temperature, num_model_calls=1,
@@ -223,7 +225,7 @@ class TemporalWeightedMethod(Method):
         try:
             g = self.backend.generate(messages, max_new_tokens=self.max_new_tokens,
                                       seed=seed, temperature=self.temperature)
-            pred = parse_choice(g.text, yn)
+            pred = parse_choice(g.text, yn, letters=letters)
             return Result(
                 **f, method=self.name, backend=self.backend.name,
                 prediction=pred, gold=gold,
@@ -245,14 +247,32 @@ class TemporalWeightedMethod(Method):
 class CVBenchNativeMethod(Method):
     name = "cvbench_native"
 
+    def __init__(self, backend, nframes=8, max_new_tokens=8192, temperature=0.0,
+                 total_frames=0):
+        super().__init__(backend, nframes=nframes, max_new_tokens=max_new_tokens,
+                         temperature=temperature)
+        # total_frames > 0 switches from a flat per-clip nframes to one TOTAL
+        # frame budget per question, split evenly across its clips (the
+        # mentor's fixed-budget protocol; per-clip counts land in frame_alloc)
+        self.total_frames = total_frames
+
     def answer(self, rec, video_root, seed=None) -> Result:
         messages, yn = build_messages(rec, video_root, self.nframes, no_video=False)
+        alloc = None
+        if self.total_frames:
+            vids = [c for c in messages[0]["content"] if c.get("type") == "video"]
+            if vids:
+                per = allocate_frames([1] * len(vids), budget=self.total_frames, floor=1)
+                for item, n in zip(vids, per):
+                    item["nframes"] = n
+                alloc = {"total_frames": self.total_frames, "per_view": per}
         f = result_fields(rec)
-        gold = gt_choice(rec["answer"], yn)
+        letters = letters_of(rec)
+        gold = gt_choice(rec["answer"], yn, letters=letters)
         try:
             g = self.backend.generate(messages, max_new_tokens=self.max_new_tokens,
                                       seed=seed, temperature=self.temperature)
-            pred = parse_choice(g.text, yn)
+            pred = parse_choice(g.text, yn, letters=letters)
             return Result(
                 **f, method=self.name, backend=self.backend.name,
                 prediction=pred, gold=gold,
@@ -262,6 +282,8 @@ class CVBenchNativeMethod(Method):
                 latency_s=g.latency_s,
                 input_tokens=g.input_tokens, video_tokens=g.video_tokens,
                 output_tokens=g.output_tokens, num_model_calls=1,
+                response_text=g.text, think=extract_think(g.text),
+                frame_alloc=alloc,
             )
         except Exception as e:
             return Result(**f, method=self.name, backend=self.backend.name,
