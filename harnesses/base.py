@@ -59,6 +59,22 @@ class Result:
         return asdict(self)
 
 
+def require_video_record(rec, method_name):
+    """Raise unless ``rec`` carries video clips, which the clip/frame arms need.
+
+    Those arms reach for ``video_paths()``, which looks only at ``video_i``. A
+    still-image record (``image_i``, e.g. All-Angles) therefore yields an empty
+    path list and the arm would run with ZERO visual items — scoring a blind run
+    while being labelled a vision one. Fail loudly instead.
+    """
+    if num_videos(rec) == 0 and num_images(rec) > 0:
+        raise ValueError(
+            f"{method_name} needs video records but question id={rec.get('id')} "
+            f"({rec.get('task_type')}) carries {num_images(rec)} still image(s) and no video. "
+            "The clip/frame-selection arms sample frames out of clips, so they cannot run on "
+            "still-image benchmarks. Use cvbench_native, centralized or per_stream instead.")
+
+
 def result_fields(rec):
     """Stratification keys copied verbatim from the question record."""
     return dict(

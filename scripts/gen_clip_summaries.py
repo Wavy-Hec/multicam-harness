@@ -29,6 +29,7 @@ import yaml
 from harnesses.clip_select import (SUMMARY_PROMPT, SUMMARY_PROMPT_VER,
                                    SUMMARY_NFRAMES, SUMMARY_MAX_NEW_TOKENS,
                                    summary_cache_files, _clip_meta)
+from dataloaders.qa_json import MAX_SLOTS
 
 _CFG = yaml.safe_load(open("configs/datasets.yaml"))
 DEFAULT_OUT = _CFG["summaries_cache"]
@@ -46,7 +47,7 @@ def clip_list(args):
 
     if args.subset:
         for rec in json.load(open(args.subset)):
-            for i in range(1, 5):
+            for i in range(1, MAX_SLOTS + 1):
                 add(rec.get(f"video_{i}"))
     else:
         with open(args.manifest) as fh:
