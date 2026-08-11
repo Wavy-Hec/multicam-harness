@@ -1,4 +1,4 @@
-# Ported from Wavy-Hec/CVBench bench/run_bench.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
+# Ported from Wavy-Hec/CVBench bench/run_bench.py @ 619af02e8e65762f725bccff302b2fd3de379d36
 """Run the multi-camera benchmark: methods x backends x passes over a subset.
 
 Usage (from repo root):
@@ -65,16 +65,22 @@ METHODS = {"centralized": CentralizedMethod, "per_stream": PerStreamMethod,
            "clip_select_top1": ClipScoreSelectMethod}
 
 # clip_select method names are generated, not enumerated: an optional scorer
-# tag (must be in SCORER_ALIASES) plus the top-m count, e.g.
-# clip_select_top2, clip_select_siglip_top1. The matched string becomes the
-# method's recorded name, so scorer variants never collide in rows/resume keys.
-CLIP_SELECT_RE = re.compile(r"^clip_select(?:_(?P<tag>[a-z0-9]+))?_top(?P<m>\d+)$")
+# tag (must be in SCORER_ALIASES), an optional _opt marker, then the top-m
+# count, e.g. clip_select_top2, clip_select_siglip_top1,
+# clip_select_siglip_opt_top1. The matched string becomes the method's recorded
+# name, so scorer and query variants never collide in rows/resume keys.
+# _opt scores frames against each ANSWER OPTION instead of the question — the
+# answer-choice-guided selection arm. The tag cannot itself be "opt".
+CLIP_SELECT_RE = re.compile(
+    r"^clip_select(?:_(?P<tag>(?!opt(?:_|$))[a-z0-9]+))?(?P<opt>_opt)?_top(?P<m>\d+)$")
 # single_view<i>: feed only view/clip i (harnesses/single_view.py); records with
 # fewer than i views are skipped, so single_view1..13 sweeps a mixed-K pool.
 SINGLE_VIEW_RE = re.compile(r"^single_view(?P<i>\d+)$")
 # frame_select: global top-budget frame selection across ALL clips (optional
-# scorer tag, e.g. frame_select_siglip); the budget comes from --budget.
-FRAME_SELECT_RE = re.compile(r"^frame_select(?:_(?P<tag>[a-z0-9]+))?$")
+# scorer tag, e.g. frame_select_siglip; optional _opt for option-guided
+# scoring); the budget comes from --budget.
+FRAME_SELECT_RE = re.compile(
+    r"^frame_select(?:_(?P<tag>(?!opt(?:_|$))[a-z0-9]+))?(?P<opt>_opt)?$")
 SCORER_ALIASES = {"siglip": "google/siglip-so400m-patch14-384",
                   "siglip2": "google/siglip2-so400m-patch14-384"}
 
@@ -86,36 +92,42 @@ def make_method(mname, backend, args):
                                  temperature=args.temperature,
                                  montage_frames=args.montage_frames, cell_px=args.cell_px,
                                  montage_kind=args.montage_kind,
-                                 total_frames=args.total_frames)
+                                 total_frames=args.total_frames,
+                                 reasoning=not args.no_reasoning)
     if mname == "per_stream":
         return PerStreamMethod(backend, nframes=args.nframes,
                                max_new_tokens=args.max_new_tokens,
                                temperature=args.temperature,
                                perception_max_new_tokens=args.perception_max_new_tokens,
                                stream_kind=args.stream_kind,
-                               total_frames=args.total_frames)
+                               total_frames=args.total_frames,
+                               reasoning=not args.no_reasoning)
     if mname == "cvbench_native":
         return CVBenchNativeMethod(backend, nframes=args.nframes,
                                    max_new_tokens=args.max_new_tokens,
                                    temperature=args.temperature,
-                                   total_frames=args.total_frames)
+                                   total_frames=args.total_frames,
+                                   reasoning=not args.no_reasoning)
     sv = SINGLE_VIEW_RE.match(mname)
     if sv:
         return SingleViewMethod(backend, view_idx=int(sv.group("i")),
                                 nframes=args.nframes,
                                 max_new_tokens=args.max_new_tokens,
-                                temperature=args.temperature, name=mname)
+                                temperature=args.temperature, name=mname,
+                                reasoning=not args.no_reasoning)
     if mname == "temporal_weighted":
         return TemporalWeightedMethod(backend, budget=args.budget, floor=args.floor,
                                       weighting=args.weighting, nframes=args.nframes,
                                       max_new_tokens=args.max_new_tokens,
-                                      temperature=args.temperature)
+                                      temperature=args.temperature,
+                                      reasoning=not args.no_reasoning)
     if mname.startswith("summary_select_"):
         return SummarySelectMethod(
             backend, summaries_path=args.summaries,
             mode=mname.rsplit("_", 1)[1], budget=args.budget, floor=args.floor,
             sel_max_new_tokens=args.sel_max_new_tokens, nframes=args.nframes,
-            max_new_tokens=args.max_new_tokens, temperature=args.temperature)
+            max_new_tokens=args.max_new_tokens, temperature=args.temperature,
+            reasoning=not args.no_reasoning)
     fm = FRAME_SELECT_RE.match(mname)
     if fm:
         tag = fm.group("tag")
@@ -128,7 +140,8 @@ def make_method(mname, backend, args):
             clip_model=SCORER_ALIASES[tag] if tag else args.clip_model,
             cell_px=args.cell_px, name=mname,
             nframes=args.nframes, max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature)
+            temperature=args.temperature, reasoning=not args.no_reasoning,
+            query="options" if fm.group("opt") else "question")
     mm = CLIP_SELECT_RE.match(mname)
     if mm:
         tag = mm.group("tag")
@@ -141,9 +154,11 @@ def make_method(mname, backend, args):
             stat=args.sel_stat, name=mname,
             budget=args.budget, floor=args.floor,
             nframes=args.nframes, max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature)
+            temperature=args.temperature, reasoning=not args.no_reasoning,
+            query="options" if mm.group("opt") else "question")
     return METHODS[mname](backend, nframes=args.nframes,
-                          max_new_tokens=args.max_new_tokens, temperature=args.temperature)
+                          max_new_tokens=args.max_new_tokens, temperature=args.temperature,
+                          reasoning=not args.no_reasoning)
 
 
 def main():
@@ -161,6 +176,11 @@ def main():
     ap.add_argument("--passes", type=int, default=4, help="independent sampled passes for std")
     ap.add_argument("--seeds", default="1,2,3,4", help="comma seeds; len must cover --passes")
     ap.add_argument("--temperature", type=float, default=0.7)
+    ap.add_argument("--no-reasoning", action="store_true",
+                    help="direct-answer prompt: no <think> trace requested. There is no "
+                         "model-side switch — the visible reasoning is produced BY the "
+                         "prompt, so turning it off means asking for the answer directly. "
+                         "The <answer> tags stay, so one parser serves both modes.")
     ap.add_argument("--budget", type=int, default=64,
                     help="temporal_weighted: TOTAL frames per question, split across clips")
     ap.add_argument("--total-frames", type=int, default=0,
@@ -193,12 +213,12 @@ def main():
     ap.add_argument("--montage-frames", type=int, default=0,
                     help="centralized montages per question (0 -> = nframes)")
     ap.add_argument("--cell-px", type=int, default=448)
-    ap.add_argument("--stream-kind", default="camera", choices=["camera", "video"],
+    ap.add_argument("--stream-kind", default="camera", choices=["camera", "video", "view"],
                     help="per_stream: label/phrase clips as synced 'camera' views "
                          "(MEVA, byte-identical to the original prompt) or independent "
                          "'video' clips (CVBench — matches the questions' 'Video k' "
                          "wording, mirroring --montage-kind)")
-    ap.add_argument("--montage-kind", default="camera", choices=["camera", "video"],
+    ap.add_argument("--montage-kind", default="camera", choices=["camera", "video", "view"],
                     help="centralized montage framing: 'camera' (synced views, default) "
                          "or 'video' (independent clips — corrected CVBench preamble + 'Video i' labels)")
     ap.add_argument("--internvl-max-tiles", type=int, default=1,
