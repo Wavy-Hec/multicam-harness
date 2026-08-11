@@ -1,5 +1,5 @@
-# Ported from Wavy-Hec/CVBench Video-R1/src/eval_thinking.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
-# Ported from Wavy-Hec/CVBench bench/reuse.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
+# Ported from Wavy-Hec/CVBench Video-R1/src/eval_thinking.py @ 7b9089009cda4badf580f4fc80960a1a3295e972
+# Ported from Wavy-Hec/CVBench bench/reuse.py @ 619af02e8e65762f725bccff302b2fd3de379d36
 """QA-record loading/prompting helpers shared by every harness.
 
 Record schema contract (one JSON object per question, in a top-level list):
@@ -34,6 +34,15 @@ QUESTION_TEMPLATE = (
     "expressions. It's encouraged to include self-reflection or verification in the "
     "reasoning process. Provide your detailed reasoning between the <think> and </think> "
     "tags, and then give your final answer between the <answer> and </answer> tags."
+)
+
+# Direct-answer (reasoning-off) variant: no visible trace is requested, but the
+# <answer> tags stay so one parser serves both modes.
+QUESTION_TEMPLATE_DIRECT = (
+    "{Question}\n"
+    "Answer immediately with your final choice. Do not explain, do not reason "
+    "step by step, and do not write anything before the answer. Give only your "
+    "final answer between the <answer> and </answer> tags."
 )
 
 
@@ -80,18 +89,35 @@ def image_paths(rec, image_root):
     return out
 
 
+# Prompt v2: enumerate every legal letter instead of eliding past six, and say
+# outright that the options are exhaustive. Both are answer-hygiene fixes, but
+# they change generation, so they are OFF by default — never flip this flag in
+# the middle of a series whose legs are meant to be compared with each other.
+# Set STRICT_ANSWER_PROMPT=1 to run a clean v2 series.
+STRICT_ANSWER_PROMPT = os.environ.get("STRICT_ANSWER_PROMPT", "0") == "1"
+
+_NO_REFUSAL = (" The options are exhaustive: choose the single best one even if "
+               "you are uncertain. Do not answer N/A, none of the above, or "
+               "cannot be determined unless that is itself one of the options.")
+
+
 def _letters_phrase(letters):
     """Human phrasing of the letter range: "A, B, C, or D" (byte-identical to
     the original 4-option prompt), "A or B", "A, B, or C", and an elided
-    "A, B, ..., or J" once enumerating would bloat the prompt."""
+    "A, B, ..., or J" once enumerating would bloat the prompt.
+
+    The elision is a measured defect: on records with seven or more options the
+    model is never told the letters past the ellipsis are legal, and abstains
+    far more often there than on short option sets. STRICT_ANSWER_PROMPT
+    enumerates them all."""
     if len(letters) == 2:
         return f"{letters[0]} or {letters[1]}"
-    if len(letters) <= 6:
+    if len(letters) <= 6 or STRICT_ANSWER_PROMPT:
         return ", ".join(letters[:-1]) + f", or {letters[-1]}"
     return f"{letters[0]}, {letters[1]}, ..., or {letters[-1]}"
 
 
-def build_messages(rec, video_root, nframes, no_video=False):
+def build_messages(rec, video_root, nframes, no_video=False, reasoning=True):
     options = rec["options"]
     is_yesno = all(o.strip().strip(".").lower() in ("yes", "no") for o in options)
     # still-image records (image_1..N view images) share the text scaffold but
@@ -108,9 +134,12 @@ def build_messages(rec, video_root, nframes, no_video=False):
                          f"based on all the listed {unit}.")
         post = (f"Provide only the single option letter ({_letters_phrase(letters)}) "
                 "within the <answer> </answer> tags.")
+        if STRICT_ANSWER_PROMPT:
+            post += _NO_REFUSAL
 
     question = rec["question"] + "\n" + "\n".join(options)
-    full_prompt = option_prompt + "\n" + QUESTION_TEMPLATE.format(Question=question) + "\n" + post
+    template = QUESTION_TEMPLATE if reasoning else QUESTION_TEMPLATE_DIRECT
+    full_prompt = option_prompt + "\n" + template.format(Question=question) + "\n" + post
 
     # interleave a text marker before each clip/view; with no_video (blind
     # baseline) keep the prompt text identical but attach zero visual input
