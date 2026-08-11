@@ -47,6 +47,37 @@ and decentralized arms; the selection arms sample frames out of clips and raise 
 clear error on a still-image record rather than silently running with no visual
 input.
 
+## Reasoning mode and option-guided selection
+
+Two knobs were added since the initial drop, both default-off so existing calls
+behave exactly as before:
+
+- **`reasoning=False`** on any arm swaps the prompt for a direct-answer
+  template. There is no model-side thinking switch — the visible trace is
+  produced by the prompt — so turning it off means asking for the answer
+  directly. The `<answer>` tags stay, so one parser serves both modes, and the
+  parser also accepts the tagless letter-plus-option-text shape that
+  direct-answer models produce.
+- **`query="options"`** on `ClipScoreSelectMethod` / `FrameSelectMethod` scores
+  frames against EACH answer option separately (reduced by max) instead of the
+  question. Options are embedded one by one, so nothing is lost to the text
+  encoder's 64/77-token cap. Rows record `query_mode` and the query count in
+  `frame_alloc`, so an option-guided row is distinguishable from a
+  question-guided one without the launch environment. A record with no usable
+  option text falls back to the question and says so in the row.
+
+Setting `STRICT_ANSWER_PROMPT=1` in the environment enables a v2 answer-hygiene
+prompt (every legal letter enumerated, options declared exhaustive so N/A-style
+refusals are ruled out). It changes generation, so it is off by default — and
+because the flag lives in the environment, a runner that adopts it should record
+its value alongside each row (ours stamps a `strict_prompt` field at write
+time), so runs on different prompt versions can never silently pool.
+
+The selection arms now fail loudly rather than degrade: an unreadable clip, or a
+similarity scorer that fails to load or score, raises instead of silently
+falling back to unguided selection — a row that looks option-guided while
+carrying no guidance is worse than a crashed leg.
+
 ## How this respects the ground rules
 
 - **Inference-only.** No training anywhere in this package; the harness is the

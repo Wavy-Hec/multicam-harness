@@ -1,5 +1,5 @@
-# Ported from Wavy-Hec/CVBench bench/methods/stitch.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
-# Ported from Wavy-Hec/CVBench bench/methods/centralized.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
+# Ported from Wavy-Hec/CVBench bench/methods/stitch.py @ 017f416ffd7fa8536c2787cee7d3b67665d4e048
+# Ported from Wavy-Hec/CVBench bench/methods/centralized.py @ 7f3e480aa4fc4ce615a4735a593594f8b6e71a93
 """Spatial-stitching for the CENTRALIZED harness.
 
 The spec's centralized method "temporally aligns the video streams and
@@ -26,6 +26,7 @@ are built once and cached, so the 4 sampling passes reuse identical pixels.
 from __future__ import annotations
 
 import math
+import os
 from typing import List, Optional
 
 from PIL import Image, ImageDraw, ImageFont
@@ -44,17 +45,43 @@ def decode_aligned_frames(video_paths: List[str], nframes: int) -> List[List[Opt
 
     Returns ``frames[k][t]`` (PIL.Image), or ``None`` for a frame whose clip
     failed to decode (compose_montage fills those cells black).
+
+    A clip that decodes PARTIALLY still black-cells only its failed timesteps —
+    decord is flaky per index, and the surviving frames of that clip carry the
+    view. But a clip that cannot be read at ALL raises, because a montage built
+    from mostly-black cells is still answerable: swallowing it makes the
+    centralized harness the only one that answers (the other two raise on the
+    same file), off a black canvas, with error=None and a scored prediction.
     """
     per_cam: List[List[Optional[Image.Image]]] = []
+    unreadable: List[str] = []
     for vp in video_paths:
         try:
             vr = VideoReader(vp, ctx=cpu(0), num_threads=1)
             n = len(vr)
             idx = sample_frame_indices(n, nframes)
-            frames = [Image.fromarray(vr[i].asnumpy()).convert("RGB") for i in idx]
-        except Exception:
-            frames = [None] * nframes  # decode failure -> black cells
+        except Exception as e:
+            if not os.path.exists(vp):
+                unreadable.append(f"{vp} (missing)")
+            else:
+                unreadable.append(f"{vp} ({type(e).__name__})")
+            per_cam.append([None] * nframes)  # cannot open -> all black cells
+            continue
+        # per-frame, not one comprehension: an all-or-nothing read let a single
+        # bad index blacken the whole camera
+        frames: List[Optional[Image.Image]] = []
+        for i in idx:
+            try:
+                frames.append(Image.fromarray(vr[i].asnumpy()).convert("RGB"))
+            except Exception:
+                frames.append(None)
+        if all(f is None for f in frames):
+            unreadable.append(f"{vp} (no decodable frames)")
         per_cam.append(frames)
+    if unreadable:
+        raise FileNotFoundError(
+            f"{len(unreadable)} of {len(video_paths)} clips could not be read — "
+            f"check --video-root. First: {unreadable[0]}")
     return per_cam
 
 
@@ -103,14 +130,28 @@ def compose_montage(frames: List[Optional[Image.Image]], labels: List[str],
 def build_image_montage(image_paths: List[str], cell_px: int = 448,
                         label_prefix: str = "View") -> List[Image.Image]:
     """Still-image variant: tile the K view images of one question into a single
-    labeled grid montage (no temporal axis — T=1 by construction). A view that
-    fails to open becomes a black cell, mirroring decode_aligned_frames."""
+    labeled grid montage (no temporal axis — T=1 by construction).
+
+    Unlike the video path, a view that fails to open RAISES. Black-celling a
+    missing frame is right for video, where decord flakiness is expected and the
+    other frames of that clip still carry the view. On stills the view has
+    exactly one frame, so a swallowed failure hands the model an all-black
+    montage and the row is still written with error=null and a scored
+    prediction — while the other two arms raise on the same missing file. A
+    wrong --video-root would then silently produce a plausible
+    centralized-only number."""
     frames: List[Optional[Image.Image]] = []
+    failed: List[str] = []
     for ip in image_paths:
         try:
             frames.append(Image.open(ip).convert("RGB"))
-        except Exception:
+        except Exception as e:
+            failed.append(f"{ip} ({type(e).__name__})")
             frames.append(None)
+    if failed:
+        raise FileNotFoundError(
+            f"{len(failed)} of {len(image_paths)} view images failed to open — "
+            f"check --video-root. First: {failed[0]}")
     labels = [f"{label_prefix} {i + 1}" for i in range(len(image_paths))]
     return [compose_montage(frames, labels, cell_w=cell_px, cell_h=cell_px)]
 
@@ -168,9 +209,9 @@ class CentralizedMethod(Method):
 
     def __init__(self, backend, nframes=8, max_new_tokens=8192, temperature=0.0,
                  montage_frames=0, cell_px=448, montage_kind="camera",
-                 total_frames=0):
+                 total_frames=0, reasoning=True):
         super().__init__(backend, nframes=nframes, max_new_tokens=max_new_tokens,
-                         temperature=temperature)
+                         temperature=temperature, reasoning=reasoning)
         self.T = montage_frames if montage_frames and montage_frames > 0 else nframes
         # total_frames > 0: hold the TOTAL source-frame count (T montages x K
         # cells) fixed per question by setting T = round(total/K) per record
@@ -186,7 +227,8 @@ class CentralizedMethod(Method):
         key = rec.get("id")
         if key in self._cache:
             return self._cache[key]
-        base_msgs, yn = build_messages(rec, video_root, self.nframes, no_video=True)
+        base_msgs, yn = build_messages(rec, video_root, self.nframes, no_video=True,
+                                       reasoning=self.reasoning)
         scaffold = base_msgs[0]["content"][0]["text"]
         if num_images(rec) > 0:
             # still-image record: one montage of the view images; labels/preamble
@@ -195,18 +237,51 @@ class CentralizedMethod(Method):
             paths = image_paths(rec, video_root)
             montages = build_image_montage(paths, cell_px=self.cell_px, label_prefix="View")
             prefix = MONTAGE_PREFIX_VIEW
-            alloc = {"kind": "image_montage", "K": len(paths)}
+            # cell_px and the canvas decide the whole visual budget on stills, and
+            # neither is otherwise recoverable from a row — only echoed to the
+            # sbatch log. Without them a leg run at a different cell size is
+            # indistinguishable from one that was not.
+            alloc = {"kind": "image_montage", "K": len(paths),
+                     "cell_px": self.cell_px,
+                     "canvas_wh": list(montages[0].size),
+                     # InternVL re-tiles the canvas by aspect ratio, so max_tiles
+                     # — not cell_px — is what sets the montage token budget on
+                     # that backend. Record it or the leg is unauditable.
+                     "max_tiles": getattr(self.backend, "max_tiles", None)}
         else:
             paths = video_paths(rec, video_root)
             t = self.T
             if self.total_frames:
-                t = max(1, round(self.total_frames / len(paths)))
+                # One montage is one timestep across ALL K cameras, so this
+                # harness can only deliver t*K frames for integer t — it cannot
+                # match an arbitrary budget unless K divides it. round() went
+                # OVER the budget for some K and under for others, so an
+                # equal-budget comparison was biased in a direction that flipped
+                # with camera count. Floor instead: never exceed, so the montage
+                # harness is never the flattered one, and record what was
+                # actually delivered so comparisons can use that rather than
+                # the nominal.
+                # A budget below K cannot be honoured at all (one frame per
+                # camera already exceeds it); clamping to t=1 silently delivered
+                # K frames, the exact overshoot the floor exists to prevent.
+                if self.total_frames < len(paths):
+                    raise ValueError(
+                        f"total_frames={self.total_frames} < {len(paths)} views: "
+                        "the montage arm cannot hold this budget")
+                t = self.total_frames // len(paths)
             montages = build_montages(paths, nframes=max(self.nframes, t), T=t,
                                       cell_px=self.cell_px, label_prefix=self._label)
             prefix = self._prefix
             alloc = {"kind": "montage", "T": t, "K": len(paths),
                      "frames_total": t * len(paths),
-                     "total_frames": self.total_frames or None}
+                     "total_frames": self.total_frames or None,
+                     # same reason as the still-image branch above: cell_px and
+                     # max_tiles set the whole visual budget and are otherwise
+                     # recoverable only from the sbatch log, which leaves every
+                     # video montage leg unauditable for tiling from its rows
+                     "cell_px": self.cell_px,
+                     "canvas_wh": list(montages[0].size) if montages else None,
+                     "max_tiles": getattr(self.backend, "max_tiles", None)}
         gold = gt_choice(rec["answer"], yn, letters=letters_of(rec))
         self._cache = {key: (montages, scaffold, yn, gold, len(paths), prefix, alloc)}  # last rec only
         return self._cache[key]
@@ -230,7 +305,7 @@ class CentralizedMethod(Method):
         try:
             g = self.backend.generate(messages, max_new_tokens=self.max_new_tokens,
                                       seed=seed, temperature=self.temperature)
-            pred = parse_choice(g.text, yn, letters=letters)
+            pred = parse_choice(g.text, yn, letters=letters, options=rec.get('options'))
             return Result(
                 **f, method=self.name, backend=self.backend.name,
                 prediction=pred, gold=gold,

@@ -1,10 +1,14 @@
-# Ported from Wavy-Hec/CVBench Video-R1/src/eval_thinking.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
-# Ported from Wavy-Hec/CVBench bench/metrics.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
+# Ported from Wavy-Hec/CVBench Video-R1/src/eval_thinking.py @ 7b9089009cda4badf580f4fc80960a1a3295e972
+# Ported from Wavy-Hec/CVBench bench/metrics.py @ 532d93b1b78993e21d1910a3219e4f04ab193b89
 """Answer scoring + benchmark metric aggregation.
 
 ``extract_think`` / ``extract_answer`` / ``parse_choice`` / ``gt_choice`` are
-vendored byte-faithfully from ``Video-R1/src/eval_thinking.py`` so this repo
-parses and scores answers identically to the original harness.
+vendored from ``Video-R1/src/eval_thinking.py`` so this repo parses and scores
+answers identically to the reference harness. The reference has since fixed two
+scoring faults, and this file tracks it: a body that names no option letter is
+no longer stored verbatim as a prediction, and a tagless direct answer is now
+recovered instead of abstaining. Keeping the two in step is the point — the
+equivalence claim is only meaningful against the reference's current behaviour.
 
 The rest aggregates per-question Result rows into the benchmark metrics (M1-M4).
 
@@ -52,11 +56,102 @@ _CONCLUDE_YN = re.compile(
 )
 
 
-def parse_choice(text, is_yesno, letters="ABCD"):
+# An explicit refusal, as opposed to a real option. Checked AFTER the verbatim
+# option match below, because "Cannot be determined" is a genuine option on some
+# temporal questions and must score as that option there.
+_REFUSAL = re.compile(
+    r"(?i)^\W*(n/?a\b|none\s+of\s+the\s+(above|options|provided)|none\b|"
+    r"cannot\s+be\s+determined|can(?:no|')t\s+(?:be\s+)?determin|unknown\b|"
+    r"unanswerable\b|not\s+determinable|insufficient\b|unclear\b)")
+
+
+def _body_to_letter(body, letters, options=None):
+    """Map an <answer> body to a single option letter, or "" to abstain.
+
+    The rule this replaces was ``re.search("(?i)\\b([ABCD])\\b", body)`` — first
+    match wins, case-insensitive — which reads the English article "a" as option
+    A, so 'None of the above... does not show a lady' scored as a confident A.
+    It also took the first of several listed letters and stored non-letter prose
+    as a prediction with abstained=False.
+    """
+    body = body.strip()
+    # 1. a bare letter, with or without decoration: "A", "(A)", "A.", "A:"
+    m = re.fullmatch(r"\W*([" + letters + r"])\W*", body, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    # 2. the body quotes an option verbatim -> that option's letter
+    if options:
+        norm = re.sub(r"\W+", " ", body).strip().lower()
+        norm_lead = re.sub(r"^\s*[A-Za-z]\s*[.)]\s*", "", body)
+        norm_lead = re.sub(r"\W+", " ", norm_lead).strip().lower()
+        # a body that leads with its own valid letter AND that option's text
+        # names the option outright; honour the letter before any text-only
+        # matching, or an option set where one text prefixes another ("Video 1"
+        # / "Video 1 and Video 4") credits the shorter option
+        lead = _leading_letter_option(body, letters, options)
+        if lead:
+            return lead
+        texts = []
+        for opt in options[:len(letters)]:
+            otext = re.sub(r"^\s*[A-Za-z]\s*[.)]\s*", "", str(opt))
+            texts.append(re.sub(r"\W+", " ", otext).strip().lower())
+        # exact whole-option quotes beat prefix matches, for the same reason
+        for i, otext in enumerate(texts):
+            if otext and (norm == otext or norm_lead == otext):
+                return letters[i].upper()
+        for i, otext in enumerate(texts):
+            if otext and any(n.startswith(otext) for n in (norm, norm_lead)):
+                return letters[i].upper()
+    # 3. an explicit refusal -> abstain
+    if _REFUSAL.match(body):
+        return ""
+    # 4. a standalone option letter. Case-insensitive EXCEPT lowercase "a"/"i",
+    #    which are English words. Ambiguous if several.
+    found = {m.group(1).upper() for m in re.finditer(r"\b([" + letters + r"])\b",
+                                                     body, re.IGNORECASE)
+             if not (m.group(1) in ("a", "i"))}
+    if len(found) == 1:
+        return found.pop()
+    return ""
+
+
+def _leading_letter_option(body, letters, options):
+    """Map ``"A. <the option's own text>"`` to ``"A"``, else "".
+
+    This is how a model answers in direct-answer mode: the letter AND the option
+    text, with no tags. Safe to trust at any length precisely because the text
+    after the letter has to BE that option, so a reasoning trace that merely
+    opens with "A." cannot match.
+    """
+    if not options:
+        return ""
+    m = re.match(r"\W*([" + letters + r"])\s*[.):]\s*(.+)", body,
+                 re.DOTALL | re.IGNORECASE)
+    if not m:
+        return ""
+    letter = m.group(1).upper()
+    i = letters.upper().index(letter)
+    if i >= len(options):
+        return ""
+    otext = re.sub(r"^\s*[A-Za-z]\s*[.)]\s*", "", str(options[i]))
+    otext = re.sub(r"\W+", " ", otext).strip().lower()
+    rest = re.sub(r"\W+", " ", m.group(2)).strip().lower()
+    if otext and (rest == otext or rest.startswith(otext)):
+        return letter
+    return ""
+
+
+def parse_choice(text, is_yesno, letters="ABCD", options=None):
     """Final answer = <answer>..</answer> if present. If the tag is missing
-    (e.g. a truncated trace), fall back ONLY to an explicit "the answer is X"
-    conclusion (last match); otherwise abstain (return "") rather than grabbing
-    an incidental letter from the reasoning prose."""
+    (e.g. a truncated trace), fall back to an explicit "the answer is X"
+    conclusion (last match), then to a tagless direct answer; otherwise abstain
+    (return "") rather than grabbing an incidental letter from reasoning prose.
+
+    ``options`` is optional and only sharpens the mapping: pass the record's
+    option list to resolve bodies that quote an option instead of naming its
+    letter, and to tell a refusal apart from an option that happens to read
+    like one.
+    """
     ans = extract_answer(text)
     if is_yesno:
         if ans:
@@ -65,10 +160,23 @@ def parse_choice(text, is_yesno, letters="ABCD"):
         ms = list(_CONCLUDE_YN.finditer(text))
         return ms[-1].group(1).capitalize() if ms else ""
     if ans:
-        m = re.search(r"(?i)\b([" + letters + r"])\b", ans)
-        return m.group(1).upper() if m else ans.strip()
+        return _body_to_letter(ans, letters, options)
     ms = list(_conclude_mc_re(letters).finditer(text))
-    return ms[-1].group(1).upper() if ms else ""
+    if ms:
+        return ms[-1].group(1).upper()
+    # direct-answer mode: no tags at all, either a bare "B" or "B. <option text>"
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    lead = _leading_letter_option(stripped, letters, options)
+    if lead:
+        return lead
+    # anything else only on a SHORT response — running _body_to_letter over a
+    # long trace would pick up incidental letters, the failure this guard exists
+    # to avoid
+    if len(stripped) <= 40:
+        return _body_to_letter(stripped, letters, options)
+    return ""
 
 
 def gt_choice(answer, is_yesno, letters="ABCD"):
@@ -178,6 +286,22 @@ def summarize_passes(rows):
     base["by_orig_num_cameras_passes"] = {
         str(c): _mstd(_pass_accs(rows, lambda r, c=c: r.get("orig_num_cameras") == c))
         for c in cams}
+    # The camera count the model was actually SHOWN, which is not always the one
+    # the dataset claims: pools are capped at MAX_SLOTS, so a row can carry an
+    # orig_num_cameras above the num_videos it was fed. Plotting accuracy
+    # against the original count puts points on the x-axis at camera counts the
+    # harness never delivered. Both groupings are kept so the capping effect
+    # stays visible instead of being silently corrected away.
+    dcams = sorted({r.get("num_videos") for r in rows},
+                   key=lambda x: (x is None, x))
+    base["by_delivered_cameras_passes"] = {
+        str(c): _mstd(_pass_accs(rows, lambda r, c=c: r.get("num_videos") == c))
+        for c in dcams}
+    base["by_task_delivered_camera_passes"] = {
+        str(tt): {str(c): _mstd(_pass_accs(
+            rows, lambda r, tt=tt, c=c: r.get("task_type") == tt
+            and r.get("num_videos") == c)) for c in dcams}
+        for tt in tts}
     base["by_task_camera_passes"] = {
         str(tt): {str(c): _mstd(_pass_accs(
             rows, lambda r, tt=tt, c=c: r.get("task_type") == tt
