@@ -1,5 +1,5 @@
 #!/bin/bash
-# Ported from Wavy-Hec/CVBench bench/run_bench.sbatch @ 480d6f41cddddc7efea9a09b79134811740ba17a
+# Ported from Wavy-Hec/CVBench bench/run_bench.sbatch @ 619af02e8e65762f725bccff302b2fd3de379d36
 ### Multi-camera benchmark sweep (2 models x 2 harnesses x 4 passes).
 ### Supports Slurm-array sharding (OFFSET=$SLURM_ARRAY_TASK_ID, CHUNK=array size)
 ### and an env split: Qwen legs run under `cvbench`, InternVL3 under `internvl`
@@ -50,7 +50,16 @@ BUDGET=${BUDGET:-64}                   # temporal_weighted: TOTAL frames per que
 FLOOR=${FLOOR:-2}                      # temporal_weighted: per-clip minimum frames
 WEIGHTING=${WEIGHTING:-duration}       # temporal_weighted: 'duration' (weighted) | 'even' (control)
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-8192}
+PERCEPTION_MAX_NEW_TOKENS=${PERCEPTION_MAX_NEW_TOKENS:-1024}  # per_stream per-view cap (raise for thinking backends)
+TOTAL_FRAMES=${TOTAL_FRAMES:-0}        # >0: fixed TOTAL frames/question for native/centralized/per_stream
+CELL_PX=${CELL_PX:-448}                # montage cell size (raise so centralized isn't token-starved vs native)
 INTERNVL_MAX_TILES=${INTERNVL_MAX_TILES:-1}
+REASONING=${REASONING:-1}              # 0 = direct-answer prompt, no <think> trace requested
+# v2 answer-hygiene prompt (enumerate all letters + no-refusal sentence). It
+# changes generation, so never flip it mid-series; rows record it either way.
+export STRICT_ANSWER_PROMPT=${STRICT_ANSWER_PROMPT:-0}
+# reasoning is imposed BY the prompt, not a model switch, so this swaps templates
+NOREASON_ARG=""; [ "$REASONING" = "0" ] && NOREASON_ARG="--no-reasoning"
 VIDEO_ROOT=${VIDEO_ROOT:-}   # override for non-MEVA sets (e.g. CVBench videos live elsewhere)
 CHUNK=${CHUNK:-0}
 # shard index: Slurm array task id if present, else OFFSET (default 0)
@@ -75,10 +84,13 @@ if [ -n "$SUMMARIES" ]; then SUM_ARG=(--summaries "$SUMMARIES"); fi
 
 echo "RUN @ $(date '+%F %T') env=$ENV subset=$SUBSET methods=$METHODS backends=$BACKENDS"
 echo "     passes=$PASSES seeds=$SEEDS temp=$TEMPERATURE budget=$BUDGET weighting=$WEIGHTING chunk=$CHUNK offset=$OFFSET out=$OUT video_root=${VIDEO_ROOT:-<default>}"
+echo "     nframes=$NFRAMES total_frames=$TOTAL_FRAMES montage_frames=$MONTAGE_FRAMES cell_px=$CELL_PX internvl_max_tiles=$INTERNVL_MAX_TILES montage_kind=$MONTAGE_KIND stream_kind=$STREAM_KIND reasoning=$REASONING strict_prompt=$STRICT_ANSWER_PROMPT"
 python run_vqa.py --subset "$SUBSET" --methods "$METHODS" --backends "$BACKENDS" \
     --nframes "$NFRAMES" --passes "$PASSES" --seeds "$SEEDS" --temperature "$TEMPERATURE" \
     --montage-frames "$MONTAGE_FRAMES" --montage-kind "$MONTAGE_KIND" --stream-kind "$STREAM_KIND" \
+    --total-frames "$TOTAL_FRAMES" \
     --budget "$BUDGET" --floor "$FLOOR" --weighting "$WEIGHTING" \
     --max-new-tokens "$MAX_NEW_TOKENS" \
-    --internvl-max-tiles "$INTERNVL_MAX_TILES" --out "$OUT" $SHARD_ARG $LIMIT_ARG $VR_ARG "${SUM_ARG[@]}"
+    --perception-max-new-tokens "$PERCEPTION_MAX_NEW_TOKENS" --cell-px "$CELL_PX" \
+    --internvl-max-tiles "$INTERNVL_MAX_TILES" --out "$OUT" $NOREASON_ARG $SHARD_ARG $LIMIT_ARG $VR_ARG "${SUM_ARG[@]}"
 echo "DONE @ $(date '+%F %T')"
