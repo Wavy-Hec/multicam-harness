@@ -1,5 +1,5 @@
-# Ported from Wavy-Hec/CVBench Video-R1/src/eval_thinking.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
-# Ported from Wavy-Hec/CVBench bench/metrics.py @ 480d6f41cddddc7efea9a09b79134811740ba17a
+# Ported from Wavy-Hec/CVBench Video-R1/src/eval_thinking.py @ 7b9089009cda4badf580f4fc80960a1a3295e972
+# Ported from Wavy-Hec/CVBench bench/metrics.py @ 532d93b1b78993e21d1910a3219e4f04ab193b89
 """Answer scoring + benchmark metric aggregation.
 
 ``extract_think`` / ``extract_answer`` / ``parse_choice`` / ``gt_choice`` are
@@ -84,11 +84,23 @@ def _body_to_letter(body, letters, options=None):
         norm = re.sub(r"\W+", " ", body).strip().lower()
         norm_lead = re.sub(r"^\s*[A-Za-z]\s*[.)]\s*", "", body)
         norm_lead = re.sub(r"\W+", " ", norm_lead).strip().lower()
-        for i, opt in enumerate(options[:len(letters)]):
+        # a body that leads with its own valid letter AND that option's text
+        # names the option outright; honour the letter before any text-only
+        # matching, or an option set where one text prefixes another ("Video 1"
+        # / "Video 1 and Video 4") credits the shorter option
+        lead = _leading_letter_option(body, letters, options)
+        if lead:
+            return lead
+        texts = []
+        for opt in options[:len(letters)]:
             otext = re.sub(r"^\s*[A-Za-z]\s*[.)]\s*", "", str(opt))
-            otext = re.sub(r"\W+", " ", otext).strip().lower()
-            if otext and any(n == otext or n.startswith(otext)
-                             for n in (norm, norm_lead)):
+            texts.append(re.sub(r"\W+", " ", otext).strip().lower())
+        # exact whole-option quotes beat prefix matches, for the same reason
+        for i, otext in enumerate(texts):
+            if otext and (norm == otext or norm_lead == otext):
+                return letters[i].upper()
+        for i, otext in enumerate(texts):
+            if otext and any(n.startswith(otext) for n in (norm, norm_lead)):
                 return letters[i].upper()
     # 3. an explicit refusal -> abstain
     if _REFUSAL.match(body):
@@ -274,6 +286,22 @@ def summarize_passes(rows):
     base["by_orig_num_cameras_passes"] = {
         str(c): _mstd(_pass_accs(rows, lambda r, c=c: r.get("orig_num_cameras") == c))
         for c in cams}
+    # The camera count the model was actually SHOWN, which is not always the one
+    # the dataset claims: pools are capped at MAX_SLOTS, so a row can carry an
+    # orig_num_cameras above the num_videos it was fed. Plotting accuracy
+    # against the original count puts points on the x-axis at camera counts the
+    # harness never delivered. Both groupings are kept so the capping effect
+    # stays visible instead of being silently corrected away.
+    dcams = sorted({r.get("num_videos") for r in rows},
+                   key=lambda x: (x is None, x))
+    base["by_delivered_cameras_passes"] = {
+        str(c): _mstd(_pass_accs(rows, lambda r, c=c: r.get("num_videos") == c))
+        for c in dcams}
+    base["by_task_delivered_camera_passes"] = {
+        str(tt): {str(c): _mstd(_pass_accs(
+            rows, lambda r, tt=tt, c=c: r.get("task_type") == tt
+            and r.get("num_videos") == c)) for c in dcams}
+        for tt in tts}
     base["by_task_camera_passes"] = {
         str(tt): {str(c): _mstd(_pass_accs(
             rows, lambda r, tt=tt, c=c: r.get("task_type") == tt
