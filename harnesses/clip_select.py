@@ -1,4 +1,4 @@
-# Ported from Wavy-Hec/CVBench bench/methods/clip_select.py @ 6da776f3533ff9afcde0d059bebf1bef9dc3d4d1
+# Ported from Wavy-Hec/CVBench bench/methods/clip_select.py @ 7f3e480aa4fc4ce615a4735a593594f8b6e71a93
 # Deliberate delta vs source: gen_clip_summaries references updated from the
 # fork's `bench/gen_clip_summaries.py` module path to this repo's
 # `scripts/gen_clip_summaries.py` (docstring, comment, and SystemExit hint).
@@ -75,14 +75,23 @@ def clip_scores(clip_bundle, text, pil_frames, batch=32):
     # get_{text,image}_features; >=5 (the cvbench env) returns a ModelOutput
     # whose .pooler_output IS that projected embedding (verified identical to
     # the forward image_embeds/text_embeds path). Coerce so scoring works in
-    # both envs — otherwise the .norm() call raises and callers silently fall
-    # back to uniform sampling.
+    # both envs — otherwise the .norm() call raises on a healthy setup.
     def _emb(x):
         return x if hasattr(x, "norm") else x.pooler_output
     # SigLIP was trained with fixed 64-token max_length padding; CLIP with
     # dynamic padding. Mismatched padding shifts SigLIP text embeddings.
     pad = "max_length" if getattr(model.config, "model_type", "") == "siglip" else True
-    tok = proc(text=[text], return_tensors="pt", padding=pad, truncation=True).to(device)
+    # One text or many. Scoring frames against EACH answer option separately (and
+    # reducing by max) is what the option-guided arms need, and it is also what
+    # keeps the query inside the text encoder's window: CLIP truncates at 77
+    # tokens and SigLIP at 64, so a concatenated question+all-options blob is
+    # silently cut, while individual options never come close.
+    # Per-text embeddings are unaffected by batching: SigLIP already pads to a
+    # fixed 64, and CLIP's encoder is causal and pools at the EOT position with
+    # pads masked, so a text's embedding does not depend on its batch-mates.
+    one_text = isinstance(text, str)
+    texts = [text] if one_text else list(text)
+    tok = proc(text=texts, return_tensors="pt", padding=pad, truncation=True).to(device)
     with torch.no_grad():
         t_emb = _emb(model.get_text_features(**tok))
         t_emb = t_emb / t_emb.norm(dim=-1, keepdim=True)
@@ -91,8 +100,39 @@ def clip_scores(clip_bundle, text, pil_frames, batch=32):
             chunk = proc(images=pil_frames[i:i + batch], return_tensors="pt").to(device)
             i_emb = _emb(model.get_image_features(**chunk))
             i_emb = i_emb / i_emb.norm(dim=-1, keepdim=True)
-            sims.append((i_emb @ t_emb.T).squeeze(1).float().cpu().numpy())
-    return np.concatenate(sims)
+            # [n_frames_in_batch, n_texts]; the historical contract is 1-D, so
+            # only the single-text call collapses the text axis.
+            sims.append((i_emb @ t_emb.T).float().cpu().numpy())
+    out = np.concatenate(sims, axis=0)
+    return out[:, 0] if one_text else out
+
+
+OPT_PREFIX = re.compile(r"^\s*[A-Za-z]\s*[.)]\s*")   # == evaluation/scoring.py
+
+
+def option_texts(rec):
+    """The answer options as retrieval queries, letter prefix stripped.
+
+    Score against EACH option and reduce by max, with the question never used.
+    Each option is embedded on its own, so nothing is lost to the text
+    encoder's 64/77-token cap — unlike one concatenated question+options blob,
+    which is silently truncated.
+    """
+    return [OPT_PREFIX.sub("", str(o)).strip() for o in rec.get("options", [])]
+
+
+def query_for(rec, mode):
+    """(query, mode_actually_used) for a record under ``mode``.
+
+    Falls back to the question when a record carries no options, so an
+    option-guided leg can never silently score against an empty query — and the
+    row records which of the two it really used.
+    """
+    if mode == "options":
+        opts = [o for o in option_texts(rec) if o]
+        if opts:
+            return opts, "options"
+    return rec.get("question", ""), "question"
 
 # --------------------------------------------------------------------------- #
 # prompts                                                                      #
@@ -334,9 +374,9 @@ class SummarySelectMethod(Method):
 
     def __init__(self, backend, summaries_path, mode="route", budget=64, floor=2,
                  sel_max_new_tokens=512, nframes=8, max_new_tokens=8192,
-                 temperature=0.0):
+                 temperature=0.0, reasoning=True):
         super().__init__(backend, nframes=nframes, max_new_tokens=max_new_tokens,
-                         temperature=temperature)
+                         temperature=temperature, reasoning=reasoning)
         assert mode in ("route", "top1")
         self.mode = mode
         self.budget = budget
@@ -379,7 +419,8 @@ class SummarySelectMethod(Method):
         if key in self._cache:
             return self._cache[key]
         require_video_record(rec, self.name)
-        base_msgs, yn = build_messages(rec, video_root, self.nframes, no_video=True)
+        base_msgs, yn = build_messages(rec, video_root, self.nframes, no_video=True,
+                                       reasoning=self.reasoning)
         scaffold = base_msgs[0]["content"][0]["text"]
         paths = video_paths(rec, video_root)
         rels = _rel_keys(rec)
@@ -462,7 +503,7 @@ class SummarySelectMethod(Method):
         try:
             g = self.backend.generate(messages, max_new_tokens=self.max_new_tokens,
                                       seed=seed, temperature=self.temperature)
-            pred = parse_choice(g.text, yn, letters=letters, options=rec.get("options"))
+            pred = parse_choice(g.text, yn, letters=letters, options=rec.get('options'))
             return Result(
                 **f, method=self.name, backend=self.backend.name,
                 prediction=pred, gold=gold,
@@ -489,9 +530,9 @@ class ClipScoreSelectMethod(Method):
     def __init__(self, backend, top_m=1, thumbs=8,
                  clip_model="openai/clip-vit-base-patch32", budget=64, floor=2,
                  nframes=8, max_new_tokens=8192, temperature=0.0,
-                 stat="max", name=None):
+                 stat="max", name=None, reasoning=True, query="question"):
         super().__init__(backend, nframes=nframes, max_new_tokens=max_new_tokens,
-                         temperature=temperature)
+                         temperature=temperature, reasoning=reasoning)
         self.top_m = int(top_m)
         self.thumbs = thumbs
         self.clip_model_name = clip_model
@@ -500,6 +541,8 @@ class ClipScoreSelectMethod(Method):
         if stat not in ("max", "mean"):
             raise ValueError(f"stat must be 'max' or 'mean', got {stat!r}")
         self.stat = stat
+        # "question" (historic) | "options" (the answer-choice-guided arm)
+        self.query = query
         # The CLI method string (e.g. clip_select_siglip_top2) is passed in as
         # name so rows/resume keys distinguish scorer variants; the bare
         # default keeps old clip_select_top1 rows compatible.
@@ -518,8 +561,11 @@ class ClipScoreSelectMethod(Method):
             self._clip = (model, proc, dev)
         return self._clip
 
-    def _score_clip(self, vp, question):
-        """(max_sim, mean_sim) of the question vs ``thumbs`` uniform thumbnails."""
+    def _score_clip(self, vp, query):
+        """(max_sim, mean_sim) of ``query`` vs ``thumbs`` uniform thumbnails.
+
+        ``query`` is the question (one string) or the answer options (a list).
+        """
         from PIL import Image
         vr = VideoReader(vp, ctx=cpu(0), num_threads=1)
         n_total = len(vr)
@@ -529,7 +575,13 @@ class ClipScoreSelectMethod(Method):
                       for j in range(self.thumbs)})
         frames = vr.get_batch(idx).asnumpy()
         pil = [Image.fromarray(fr).convert("RGB") for fr in frames]
-        s = clip_scores(self._ensure_clip(), question, pil)
+        s = clip_scores(self._ensure_clip(), query, pil)
+        if s.ndim == 2:
+            # [thumbs, options] -> best thumb per option, then the max across
+            # options is the clip's score, so the offline option-similarity gate
+            # and this arm apply the identical reduction and the gate's measured
+            # retrieval accuracy predicts what this arm will select.
+            return float(s.max(axis=0).max()), float(s.mean(axis=0).max())
         return float(np.max(s)), float(np.mean(s))
 
     def _prepare(self, rec, video_root):
@@ -537,7 +589,8 @@ class ClipScoreSelectMethod(Method):
         if key in self._cache:
             return self._cache[key]
         require_video_record(rec, self.name)
-        base_msgs, yn = build_messages(rec, video_root, self.nframes, no_video=True)
+        base_msgs, yn = build_messages(rec, video_root, self.nframes, no_video=True,
+                                       reasoning=self.reasoning)
         scaffold = base_msgs[0]["content"][0]["text"]
         paths = video_paths(rec, video_root)
         K = len(paths)
@@ -548,21 +601,19 @@ class ClipScoreSelectMethod(Method):
             ncaps.append(n)
 
         fallback = None
+        query, qmode = query_for(rec, self.query)
         smax, smean = [], []
+        # a per-clip scoring failure raises: swallowing it to -inf silently
+        # demoted that clip (or, all failing, degraded the arm to select-ALL
+        # with error=null) — rows that look guided while carrying no guidance
         for vp in paths:
-            try:
-                mx, mn = self._score_clip(vp, rec.get("question", ""))
-            except Exception:
-                mx, mn = float("-inf"), float("-inf")
+            mx, mn = self._score_clip(vp, query)
             smax.append(mx)
             smean.append(mn)
         m = min(self.top_m, K)
         ranking = smax if self.stat == "max" else smean
-        if all(x == float("-inf") for x in ranking):  # scoring failed everywhere
-            sel_idx, fallback = list(range(1, K + 1)), "fallback:score_error_all"
-        else:
-            order = sorted(range(K), key=lambda i: -ranking[i])
-            sel_idx = sorted(i + 1 for i in order[:m])
+        order = sorted(range(K), key=lambda i: -ranking[i])
+        sel_idx = sorted(i + 1 for i in order[:m])
 
         content, nframes = present_selected(paths, durs, ncaps, sel_idx,
                                             self.budget, self.floor, scaffold)
@@ -578,6 +629,10 @@ class ClipScoreSelectMethod(Method):
             "thumbs": self.thumbs,
             "clip_model": self.clip_model_name,
             "sel_stat": self.stat,
+            # what the selector actually scored against, so an option-guided row
+            # is distinguishable from a question-guided one without the launch env
+            "query_mode": qmode,
+            "n_query_texts": len(query) if isinstance(query, list) else 1,
             "clip_scores_max": [None if x == float("-inf") else round(x, 4) for x in smax],
             "clip_scores_mean": [None if x == float("-inf") else round(x, 4) for x in smean],
             "durations_s": [round(d, 2) if d is not None else None for d in durs],
@@ -611,10 +666,12 @@ class FrameSelectMethod(Method):
     def __init__(self, backend, budget=64, candidates_per_video=32,
                  clip_model="openai/clip-vit-base-patch32", cell_px=448,
                  nframes=8, max_new_tokens=8192, temperature=0.0, name=None,
-                 floor=1):
+                 floor=1, reasoning=True, query="question"):
         super().__init__(backend, nframes=nframes, max_new_tokens=max_new_tokens,
-                         temperature=temperature)
+                         temperature=temperature, reasoning=reasoning)
         self.budget = int(budget)
+        # "question" (historic) | "options" (the answer-choice-guided arm)
+        self.query = query
         # Per-clip minimum, so a global ranking can never starve a whole camera.
         # The sibling arms get this via allocate_frames(floor=2); 1 is the least
         # that satisfies "never keep 0 frames of any clip" while leaving the
@@ -637,22 +694,41 @@ class FrameSelectMethod(Method):
         return self._clip
 
     def _candidates(self, vp):
-        """Up to candidates_per_video uniform (time_s, PIL) frames, or [] on
-        decode failure — the pool this clip contributes to the global ranking."""
+        """Up to candidates_per_video uniform (time_s, PIL) frames — the pool
+        this clip contributes to the global ranking.
+
+        Same recovery policy as the montage path (decode_aligned_frames):
+        decord flakiness costs only the failed indices, but a clip with no
+        readable frames at all raises — that is a missing file or a wrong
+        --video-root, and swallowing it let this arm answer from partial (or
+        zero) visual input with error=null while the centralized complement
+        raised on the very same record, inventing an arm difference out of
+        error handling.
+        """
         from PIL import Image
         try:
             vr = VideoReader(vp, ctx=cpu(0), num_threads=1)
             n = len(vr)
-            if n <= 0:
-                return []
             fps = float(vr.get_avg_fps())
-            k = min(self.candidates_per_video, n)
-            idx = sorted({min(n - 1, int((j + 0.5) * n / k)) for j in range(k)})
-            frames = vr.get_batch(idx).asnumpy()
-            return [((fi / fps) if fps > 0 else None,
-                     Image.fromarray(fr).convert("RGB")) for fi, fr in zip(idx, frames)]
-        except Exception:
-            return []
+        except Exception as e:
+            kind = "missing" if not os.path.exists(vp) else type(e).__name__
+            raise FileNotFoundError(
+                f"unreadable clip {vp} ({kind}) — check --video-root") from e
+        if n <= 0:
+            raise FileNotFoundError(f"unreadable clip {vp} (0 frames)")
+        k = min(self.candidates_per_video, n)
+        idx = sorted({min(n - 1, int((j + 0.5) * n / k)) for j in range(k)})
+        out = []
+        for fi in idx:
+            try:
+                fr = vr[fi].asnumpy()
+            except Exception:
+                continue
+            out.append(((fi / fps) if fps > 0 else None,
+                        Image.fromarray(fr).convert("RGB")))
+        if not out:
+            raise FileNotFoundError(f"unreadable clip {vp} (no decodable frames)")
+        return out
 
     def _resize(self, im):
         w, h = im.size
@@ -666,7 +742,8 @@ class FrameSelectMethod(Method):
         if key in self._cache:
             return self._cache[key]
         require_video_record(rec, self.name)
-        base_msgs, yn = build_messages(rec, video_root, self.nframes, no_video=True)
+        base_msgs, yn = build_messages(rec, video_root, self.nframes, no_video=True,
+                                       reasoning=self.reasoning)
         scaffold = base_msgs[0]["content"][0]["text"]
         paths = video_paths(rec, video_root)
         K = len(paths)
@@ -681,22 +758,26 @@ class FrameSelectMethod(Method):
 
         fallback = None
         floor, starved = 0, 0
+        # resolved before the guard so alloc_meta is populated even when the
+        # record contributes no decodable frames at all
+        query, qmode = query_for(rec, self.query)
         if not pool:
-            sel = []
-            fallback = "fallback:no_frames"
+            # _candidates raises per clip, so an empty pool means K==0 slipped
+            # past require_video_record — a malformed record, not flakiness
+            raise FileNotFoundError("no candidate frames from any clip")
         else:
-            question = rec.get("question", "")
-            try:
-                scores = clip_scores(self._ensure_clip(), question, [im for _, _, im in pool])
-            except Exception as e:
-                scores = None
-                score_err = f"{type(e).__name__}: {e}"
-            if scores is None:                        # scoring failed -> uniform stride
-                fallback = f"fallback:score_error:{score_err}"
-                step = max(1, len(pool) // self.budget)
-                order = list(range(0, len(pool), step))
-            else:
-                order = sorted(range(len(pool)), key=lambda j: -float(scores[j]))
+            # A scorer failure here (weights not cached, class missing from the
+            # env, OOM) must raise, not degrade: the silent uniform-stride
+            # fallback wrote rows indistinguishable from option-guided ones
+            # (error=null, errors=0 in the summary) with zero option guidance.
+            scores = clip_scores(self._ensure_clip(), query, [im for _, _, im in pool])
+            if scores.ndim == 2:
+                # [frames, options] -> a frame's score is its best option.
+                # Reduced over options, not thumbs, because here the ranking
+                # unit IS the frame: keep the frames that any one answer
+                # choice would retrieve.
+                scores = scores.max(axis=1)
+            order = sorted(range(len(pool)), key=lambda j: -float(scores[j]))
 
             # A plain order[:budget] lets the pooled ranking starve whole clips:
             # measured over the pre-fix rows, a large share lost >=1 camera view
@@ -759,6 +840,10 @@ class FrameSelectMethod(Method):
             "floor_clips_rescued": starved,
             "floor_fired": bool(starved),
             "clip_model": self.clip_model_name,
+            # what the selector actually scored against, so an option-guided row
+            # is distinguishable from a question-guided one without the launch env
+            "query_mode": qmode,
+            "n_query_texts": len(query) if isinstance(query, list) else 1,
             "selected_times_s": {v: [round(t, 2) if t is not None else None
                                      for t, _, _ in by_video[v]] for v in sorted(by_video)},
         }

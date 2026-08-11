@@ -1,4 +1,4 @@
-# Ported from Wavy-Hec/CVBench bench/methods/base.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
+# Ported from Wavy-Hec/CVBench bench/methods/base.py @ f16922294861940df6a648f83edc3acd798158e0
 """Core abstractions for the multi-camera benchmark.
 
 A ``Method`` is an *architecture* (how the camera streams are fed to a model);
@@ -92,11 +92,14 @@ class Method:
     name = "method"
 
     def __init__(self, backend: Backend, nframes: int = 8, max_new_tokens: int = 8192,
-                 temperature: float = 0.0):
+                 temperature: float = 0.0, reasoning: bool = True):
         self.backend = backend
         self.nframes = nframes
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
+        # reasoning=False swaps the prompt for the direct-answer template: there
+        # is no model-side thinking switch, the trace is produced by the prompt
+        self.reasoning = reasoning
 
     def answer(self, rec, video_root, seed=None) -> Result:
         raise NotImplementedError

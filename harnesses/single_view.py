@@ -1,4 +1,4 @@
-# Ported from Wavy-Hec/CVBench bench/methods/single_view.py @ f65d6e043014b6e9090c32dec4893ebc14fa4320
+# Ported from Wavy-Hec/CVBench bench/methods/single_view.py @ f16922294861940df6a648f83edc3acd798158e0
 """SINGLE-VIEW oracle probe: feed ONLY view/clip ``i`` of a question, keeping the
 text scaffold byte-identical to ``cvbench_native`` (the prompt still says "all
 the listed videos" and the attached item keeps its true "Video i:" marker, so
@@ -22,9 +22,9 @@ from evaluation.scoring import extract_think, gt_choice, parse_choice
 
 class SingleViewMethod(Method):
     def __init__(self, backend, view_idx=1, nframes=8, max_new_tokens=8192,
-                 temperature=0.0, name=None):
+                 temperature=0.0, name=None, reasoning=True):
         super().__init__(backend, nframes=nframes, max_new_tokens=max_new_tokens,
-                         temperature=temperature)
+                         temperature=temperature, reasoning=reasoning)
         self.view_idx = view_idx
         self.name = name or f"single_view{view_idx}"
 
@@ -32,7 +32,8 @@ class SingleViewMethod(Method):
         k = num_videos(rec) or num_images(rec)
         if self.view_idx > k:
             return None  # runner skips: this question has no view i
-        messages, yn = build_messages(rec, video_root, self.nframes, no_video=False)
+        messages, yn = build_messages(rec, video_root, self.nframes, no_video=False,
+                                      reasoning=self.reasoning)
         content = messages[0]["content"]
         # content is [marker, visual] * K + [prompt]; keep pair i and the prompt
         visual_i = 2 * (self.view_idx - 1)
@@ -47,7 +48,7 @@ class SingleViewMethod(Method):
         try:
             g = self.backend.generate(messages, max_new_tokens=self.max_new_tokens,
                                       seed=seed, temperature=self.temperature)
-            pred = parse_choice(g.text, yn, letters=letters, options=rec.get("options"))
+            pred = parse_choice(g.text, yn, letters=letters, options=rec.get('options'))
             return Result(
                 **f, method=self.name, backend=self.backend.name,
                 prediction=pred, gold=gold,
