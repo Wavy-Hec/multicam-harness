@@ -44,17 +44,40 @@ def decode_aligned_frames(video_paths: List[str], nframes: int) -> List[List[Opt
 
     Returns ``frames[k][t]`` (PIL.Image), or ``None`` for a frame whose clip
     failed to decode (compose_montage fills those cells black).
+
+    A clip that decodes PARTIALLY still black-cells only its failed timesteps —
+    decord is flaky per index, and the surviving frames of that clip carry the
+    view. But a clip that cannot be read at ALL raises, because a montage built
+    from mostly-black cells is still answerable: swallowing it makes the
+    centralized harness the only one that answers (the other two raise on the
+    same file), off a black canvas, with error=None and a scored prediction.
     """
     per_cam: List[List[Optional[Image.Image]]] = []
+    unreadable: List[str] = []
     for vp in video_paths:
         try:
             vr = VideoReader(vp, ctx=cpu(0), num_threads=1)
             n = len(vr)
             idx = sample_frame_indices(n, nframes)
-            frames = [Image.fromarray(vr[i].asnumpy()).convert("RGB") for i in idx]
-        except Exception:
-            frames = [None] * nframes  # decode failure -> black cells
+        except Exception as e:
+            unreadable.append(f"{vp} ({type(e).__name__})")
+            per_cam.append([None] * nframes)      # cannot open -> all black
+            continue
+        # per-frame, not one comprehension: an all-or-nothing read let a single
+        # bad index blacken the whole camera
+        frames: List[Optional[Image.Image]] = []
+        for i in idx:
+            try:
+                frames.append(Image.fromarray(vr[i].asnumpy()).convert("RGB"))
+            except Exception:
+                frames.append(None)
+        if all(f is None for f in frames):
+            unreadable.append(f"{vp} (no decodable frames)")
         per_cam.append(frames)
+    if unreadable:
+        raise FileNotFoundError(
+            f"{len(unreadable)} of {len(video_paths)} clips could not be read — "
+            f"check the video root. First: {unreadable[0]}")
     return per_cam
 
 
@@ -200,7 +223,14 @@ class CentralizedMethod(Method):
             paths = video_paths(rec, video_root)
             t = self.T
             if self.total_frames:
-                t = max(1, round(self.total_frames / len(paths)))
+                # One montage is one timestep across ALL K cameras, so this
+                # harness can only deliver t*K frames for integer t — it cannot
+                # match an arbitrary budget unless K divides it. round() went
+                # OVER the budget for some K and under for others, so an
+                # equal-budget comparison was biased in a direction that flipped
+                # with camera count. Floor instead: never exceed, so the montage
+                # harness is never the flattered one.
+                t = max(1, self.total_frames // len(paths))
             montages = build_montages(paths, nframes=max(self.nframes, t), T=t,
                                       cell_px=self.cell_px, label_prefix=self._label)
             prefix = self._prefix
@@ -230,7 +260,7 @@ class CentralizedMethod(Method):
         try:
             g = self.backend.generate(messages, max_new_tokens=self.max_new_tokens,
                                       seed=seed, temperature=self.temperature)
-            pred = parse_choice(g.text, yn, letters=letters)
+            pred = parse_choice(g.text, yn, letters=letters, options=rec.get("options"))
             return Result(
                 **f, method=self.name, backend=self.backend.name,
                 prediction=pred, gold=gold,
