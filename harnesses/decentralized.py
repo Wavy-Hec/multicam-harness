@@ -106,7 +106,7 @@ class PerStreamMethod(Method):
                                       seed=seed, temperature=self.temperature)
             calls += 1
             in_tok += g.input_tokens; out_tok += g.output_tokens
-            pred = parse_choice(g.text, yn, letters=letters)
+            pred = parse_choice(g.text, yn, letters=letters, options=rec.get("options"))
 
             serial = sum(lat_per) + g.latency_s
             return Result(
