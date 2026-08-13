@@ -19,6 +19,9 @@ package has no hooks into the rest of the tree.
 | `SummarySelectMethod` | `harnesses.clip_select` | Cached per-clip text summaries routed by the same model, which picks the clips the question needs | 1–2 |
 | `ClipScoreSelectMethod` | `harnesses.clip_select` | Clips scored by CLIP/SigLIP text-image similarity over thumbnails; keep the top-m | 1 |
 | `FrameSelectMethod` | `harnesses.clip_select` | One shared budget of the most question-relevant frames chosen globally across every clip, grouped by source clip | 1 |
+| `OptionUnionFrameSelect` | `harnesses.option_union` | The union of frames passing each answer option's similarity threshold (absolute or per-option quantile), every option guaranteed its best frame | 1 |
+| `OptionUnionClipSelect` | `harnesses.option_union` | Whole clips kept when any option's threshold passes; the `viclip` scorer embeds a clip's frames jointly (video-native) from a local OpenGVLab/ViCLIP download | 1 |
+| `QuerySearchMethod` | `harnesses.option_union` | The backend writes short visual search phrases from the question and options, then the top-budget frames matching any phrase are retrieved before the answer call | 2 |
 
 Montage geometry is `cols = ceil(sqrt(K))`, `rows = ceil(K / cols)` — 2x2 at four
 views, up to 4x4 at the thirteen-slot cap.
