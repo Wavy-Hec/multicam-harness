@@ -46,7 +46,14 @@ TEMPERATURE=${TEMPERATURE:-0.7}
 MONTAGE_FRAMES=${MONTAGE_FRAMES:-0}
 MONTAGE_KIND=${MONTAGE_KIND:-camera}   # 'camera' (synced views) | 'video' (independent clips)
 STREAM_KIND=${STREAM_KIND:-camera}     # per_stream labels: 'camera' (MEVA) | 'video' (CVBench)
-BUDGET=${BUDGET:-64}                   # temporal_weighted: TOTAL frames per question
+BUDGET=${BUDGET:-}                     # selection arms: TOTAL frames per question. Empty = per-arm default
+                                       # (legacy arms 64; _optu/query_search MATCHED = nframes x K). Explicit 0
+                                       # = matched, legal only for _optu/query_search.
+SEL_TAU=${SEL_TAU:-0}                  # _optu arms: absolute per-option similarity cutoff; 0 = quantile mode
+SEL_TAU_Q=${SEL_TAU_Q:-0.85}           # _optu arms: per-option quantile when SEL_TAU=0
+N_QUERIES=${N_QUERIES:-4}              # query_search: generated search phrases per question
+QUERY_MAX_NEW_TOKENS=${QUERY_MAX_NEW_TOKENS:-256}  # query_search: phrase-generation token cap (raise for thinking backends)
+export VICLIP_DIR=${VICLIP_DIR:-$HOME/models/ViCLIP}   # clip_select_viclip_optu: local OpenGVLab/ViCLIP download
 FLOOR=${FLOOR:-2}                      # temporal_weighted: per-clip minimum frames
 WEIGHTING=${WEIGHTING:-duration}       # temporal_weighted: 'duration' (weighted) | 'even' (control)
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-8192}
@@ -83,13 +90,16 @@ SUM_ARG=()                 # array + quoted expansion so a glob reaches python i
 if [ -n "$SUMMARIES" ]; then SUM_ARG=(--summaries "$SUMMARIES"); fi
 
 echo "RUN @ $(date '+%F %T') env=$ENV subset=$SUBSET methods=$METHODS backends=$BACKENDS"
-echo "     passes=$PASSES seeds=$SEEDS temp=$TEMPERATURE budget=$BUDGET weighting=$WEIGHTING chunk=$CHUNK offset=$OFFSET out=$OUT video_root=${VIDEO_ROOT:-<default>}"
+echo "     passes=$PASSES seeds=$SEEDS temp=$TEMPERATURE budget=${BUDGET:-auto} weighting=$WEIGHTING chunk=$CHUNK offset=$OFFSET out=$OUT video_root=${VIDEO_ROOT:-<default>}"
+echo "     sel_tau=$SEL_TAU sel_tau_q=$SEL_TAU_Q n_queries=$N_QUERIES query_max_new_tokens=$QUERY_MAX_NEW_TOKENS viclip_dir=$VICLIP_DIR"
 echo "     nframes=$NFRAMES total_frames=$TOTAL_FRAMES montage_frames=$MONTAGE_FRAMES cell_px=$CELL_PX internvl_max_tiles=$INTERNVL_MAX_TILES montage_kind=$MONTAGE_KIND stream_kind=$STREAM_KIND reasoning=$REASONING strict_prompt=$STRICT_ANSWER_PROMPT"
 python run_vqa.py --subset "$SUBSET" --methods "$METHODS" --backends "$BACKENDS" \
     --nframes "$NFRAMES" --passes "$PASSES" --seeds "$SEEDS" --temperature "$TEMPERATURE" \
     --montage-frames "$MONTAGE_FRAMES" --montage-kind "$MONTAGE_KIND" --stream-kind "$STREAM_KIND" \
     --total-frames "$TOTAL_FRAMES" \
-    --budget "$BUDGET" --floor "$FLOOR" --weighting "$WEIGHTING" \
+    ${BUDGET:+--budget "$BUDGET"} --floor "$FLOOR" --weighting "$WEIGHTING" \
+    --sel-tau "$SEL_TAU" --sel-tau-q "$SEL_TAU_Q" --n-queries "$N_QUERIES" \
+    --query-max-new-tokens "$QUERY_MAX_NEW_TOKENS" \
     --max-new-tokens "$MAX_NEW_TOKENS" \
     --perception-max-new-tokens "$PERCEPTION_MAX_NEW_TOKENS" --cell-px "$CELL_PX" \
     --internvl-max-tiles "$INTERNVL_MAX_TILES" --out "$OUT" $NOREASON_ARG $SHARD_ARG $LIMIT_ARG $VR_ARG "${SUM_ARG[@]}"
