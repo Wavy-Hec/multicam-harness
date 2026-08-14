@@ -4,8 +4,12 @@ outputs/
 logs/
 runs/
 
-# Raw data / video / weights
-data/
+# Raw data / video / weights. Anchored: an unanchored `data/` also swallows
+# `scripts/data/`, so new data-builder scripts were silently skipped by `git add`
+# (the ones already tracked predate the rule). Curated subsets are inputs, not
+# data, and stay committed.
+/data/*
+!/data/subsets/
 *.avi
 *.mp4
 *.pt
