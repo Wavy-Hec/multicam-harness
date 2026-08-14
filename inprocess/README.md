@@ -50,6 +50,30 @@ and decentralized arms; the selection arms sample frames out of clips and raise 
 clear error on a still-image record rather than silently running with no visual
 input.
 
+## Rebuilding the MVU-Eval subset
+
+`data/subsets/mvueval_qa.json` — the pool `run.py`'s usage examples point at — is
+generated, not hand-written. `scripts/data/build_mvueval.py` converts MVU-Eval
+(multi-video QA, NeurIPS 2025 D&B) into the record schema above:
+
+```bash
+# needs only MVU_Eval_QAs.json from the MVU-Eval-Team/MVU-Eval-Data release;
+# no GPU, no videos, run from the repo root
+python3 scripts/data/build_mvueval.py --qa-json data/mvueval/MVU_Eval_QAs.json
+```
+
+It writes the full pool plus a task x clip-count stratified dev subset and the
+deduped clip list that subset needs, so a smaller smoke run can be assembled
+without fetching all ~4.9k clips. Questions carry 2–13 videos and 2–11 options;
+the slot cap and the legal letter range are imported from
+`inprocess/dataloaders/qa_json.py` rather than restated, so the emitted records
+cannot desync from the loader that reads them. Re-running the command on the same
+release reproduces the committed pool byte for byte.
+
+The clips are not in this repo. Point `--video-root` at wherever they were
+unpacked; MVU-Eval keeps some filenames under subdirectories, so the root is the
+directory the source paths are relative to.
+
 ## Reasoning mode and option-guided selection
 
 Two knobs were added since the initial drop, both default-off so existing calls
