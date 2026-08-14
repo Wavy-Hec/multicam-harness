@@ -50,29 +50,67 @@ and decentralized arms; the selection arms sample frames out of clips and raise 
 clear error on a still-image record rather than silently running with no visual
 input.
 
-## Rebuilding the MVU-Eval subset
+## MVU-Eval, end to end
 
-`data/subsets/mvueval_qa.json` — the pool `run.py`'s usage examples point at — is
-generated, not hand-written. `scripts/data/build_mvueval.py` converts MVU-Eval
-(multi-video QA, NeurIPS 2025 D&B) into the record schema above:
+MVU-Eval (multi-video QA, NeurIPS 2025 D&B) is the pool `run.py`'s usage examples
+point at. It is a public HF dataset — no license gate — so this runs on any
+cluster with internet and a GPU. Five steps from a fresh clone:
 
 ```bash
-# needs only MVU_Eval_QAs.json from the MVU-Eval-Team/MVU-Eval-Data release;
-# no GPU, no videos, run from the repo root
+# 1. environment. Qwen legs need `cvbench`; InternVL3 needs `internvl`, which
+#    pins an OLDER transformers -- cvbench's newer one breaks InternVL3's
+#    remote code, so one env cannot serve both.
+conda env create -f envs/cvbench.yml     # and envs/internvl.yml for InternVL3
+
+# 2. the questions (small: one JSON + one CSV)
+python3 scripts/data/fetch_mvueval_videos.py --qa-only
+
+# 3. build the record pool. No GPU, no videos needed. Reproduces the committed
+#    data/subsets/mvueval_qa.json byte for byte from the same release.
 python3 scripts/data/build_mvueval.py --qa-json data/mvueval/MVU_Eval_QAs.json
+
+# 4. the clips. The dev subset needs a few hundred; the full pool needs ~4.9k.
+python3 scripts/data/fetch_mvueval_videos.py --subset data/subsets/mvueval_dev_subset.json
+python3 scripts/data/fetch_mvueval_videos.py --check   # confirm before launching
+
+# 5. smoke it: 5 questions, one pass, sequential baseline only
+LIMIT=5 PASSES=1 SEEDS=1 METHODS=cvbench_native sbatch scripts/run_mvueval.sbatch
 ```
 
-It writes the full pool plus a task x clip-count stratified dev subset and the
-deduped clip list that subset needs, so a smaller smoke run can be assembled
-without fetching all ~4.9k clips. Questions carry 2–13 videos and 2–11 options;
-the slot cap and the legal letter range are imported from
-`inprocess/dataloaders/qa_json.py` rather than restated, so the emitted records
-cannot desync from the loader that reads them. Re-running the command on the same
-release reproduces the committed pool byte for byte.
+Then the real legs — `scripts/run_mvueval.sbatch` wraps `python -m inprocess.run`
+and shards over a Slurm array. Its partition and walltime are one cluster's
+defaults and will be wrong on yours; override with `sbatch -p <yours> -t <yours>`.
 
-The clips are not in this repo. Point `--video-root` at wherever they were
-unpacked; MVU-Eval keeps some filenames under subdirectories, so the root is the
-directory the source paths are relative to.
+```bash
+SUBSET=data/subsets/mvueval_qa.json CHUNK=8 sbatch --array=0-7 scripts/run_mvueval.sbatch
+```
+
+Step 3 emits the full pool plus a task x clip-count stratified dev subset and the
+deduped clip list that subset needs, so a smoke run never requires the whole
+release. Questions carry 2–13 videos and 2–11 options; the slot cap and the legal
+letter range are imported from `inprocess/dataloaders/qa_json.py` rather than
+restated, so emitted records cannot desync from the loader that reads them.
+
+### Four things that will bite you
+
+- **`--strict-answer-prompt` is required and has no default.** It rewrites nearly
+  every prompt of a multi-option subset, so rows produced with `0` and rows
+  produced with `1` **cannot be pooled**. Agree on one value with anyone else
+  running these legs before either of you launches, and check the `strict_prompt`
+  field on the rows before combining anything.
+- **The release ships two answer keys that disagree.** `MVU_Eval_QAs.json` and
+  `mvu_eval_config.csv` differ on a minority of questions. `build_mvueval.py`
+  reads the JSON. Say which key you scored against.
+- **`clip_select_viclip_optu` needs a gated download.** ViCLIP is not on PyPI:
+  `huggingface-cli login`, then `huggingface-cli download OpenGVLab/ViCLIP
+  --local-dir $VICLIP_DIR` (default `~/models/ViCLIP`), and it must be the
+  *full* download — code files and the `ViClip-InternVid-10M-FLT.pth`
+  checkpoint. The other `.pth` in that repo is vision-encoder-only and is not a
+  valid fallback. The other two arms need no gated weights.
+- **On InternVL3, keep `--internvl-max-tiles 1`.** An image is tiled while a
+  video frame is not, so a matched frame budget stops being matched once tiling
+  is on; the selection arms refuse to construct rather than produce a
+  tokenization artifact. The sbatch sets this automatically for `ENV=internvl`.
 
 ## Reasoning mode and option-guided selection
 
