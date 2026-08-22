@@ -34,6 +34,13 @@ Gating / usage (the fork checkout is READ-ONLY — never write bytecode into it)
 Exits 0 with a skip message when CVBENCH_FORK is unset; exits 1 on any
 divergence, printing the first divergent line/pixel with context.
 
+A SKIP IS NOT A PASS: the comparison also requires the fork checkout to still
+hold the CVBench videos (Video-R1/src/r1-v/Evaluation/CVBench) — the fork
+purged them on 2026-07-27, so until they are restored from the archive (or
+subset/video_root in main() is repointed at an on-disk dataset) every run
+exits 0 vacuously. Grep for the "pairs byte/pixel-identical" line, not the
+exit code, before claiming equivalence.
+
 sys.path hygiene (IMPORTANT — the ordering below is load-bearing):
   * The fork's package is ``bench.*`` and this repo's modules are top-level
     (``harnesses``/``models``/``dataloaders``/``evaluation``), so both trees can
