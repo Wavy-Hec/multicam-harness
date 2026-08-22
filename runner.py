@@ -39,13 +39,17 @@ def run(args, METHODS, NAME_RES, make_backend, make_method):
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
     # NAME_RES: one compiled regex, or an iterable of them, covering the
-    # generated method names (clip_select_*, frame_select*, single_view<i>)
+    # generated method names (clip_select_*, frame_select*, single_view<i>,
+    # the _optu option-union arms, query_search_*, segment_select_*)
     name_res = [NAME_RES] if hasattr(NAME_RES, "match") else list(NAME_RES)
     for m in methods:
         if m not in METHODS and not any(r.match(m) for r in name_res):
             raise SystemExit(f"unknown method '{m}'. Known: {list(METHODS)} "
-                             f"or clip_select[_<scorer>]_top<m> / "
-                             f"frame_select[_<scorer>] / single_view<i>")
+                             f"or clip_select[_<scorer>][_opt]_top<m> / "
+                             f"clip_select[_<scorer>|_viclip]_optu / "
+                             f"frame_select[_<scorer>][_opt|_optu] / "
+                             f"query_search[_<scorer>] / "
+                             f"segment_select[_<scorer>][_opt] / single_view<i>")
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()][: args.passes]
     if len(seeds) < args.passes:
         raise SystemExit(f"need >= {args.passes} seeds, got {seeds}")
